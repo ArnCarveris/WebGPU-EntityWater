@@ -1,0 +1,2192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Entity Water</title>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #030507;
+            --panel: rgba(6, 12, 16, 0.78);
+            --line: rgba(110, 220, 255, 0.28);
+            --accent: #6edcff;
+            --ok: #62f08a;
+            --warn: #ffc94a;
+            --danger: #ff4a3d;
+            --text: #d6e6ee;
+            --muted: #7d95a3;
+        }
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            height: 100%;
+            overflow: hidden;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Rajdhani', sans-serif;
+            user-select: none;
+        }
+        canvas#view { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+        canvas#view.drag { cursor: grabbing; }
+        canvas#labels { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; }
+        .panel {
+            position: fixed;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            padding: 8px 10px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
+            line-height: 1.35;
+            pointer-events: none;
+        }
+        #hud { top: 12px; left: 12px; min-width: 340px; max-width: calc(100vw - 24px); white-space: pre; overflow: hidden; }
+        #hud .t { color: var(--accent); letter-spacing: 0.12em; }
+        #hud .on { color: var(--ok); }
+        #hud .off { color: var(--danger); }
+        #hud .w { color: var(--warn); }
+        #hud .m { color: var(--muted); }
+        #help { bottom: 12px; left: 12px; white-space: pre; color: var(--muted); }
+        #help b { color: var(--text); font-weight: normal; }
+        #tools { bottom: 12px; right: 12px; white-space: pre; color: var(--muted); }
+        #tools b { color: var(--accent); font-weight: normal; }
+        #tools .sel { color: var(--warn); }
+        #toast { top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--warn); font-size: 16px; display: none; text-align: center; }
+        #fallback { display: none; position: fixed; inset: 0; z-index: 50; align-items: center; justify-content: center; background: var(--bg); padding: 16px; }
+        #fallback.show { display: flex; }
+        .card { max-width: 480px; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--danger); padding: 14px 16px; }
+        .tag { font-family: 'Share Tech Mono', monospace; font-size: 11px; letter-spacing: 0.12em; color: var(--danger); }
+        h1 { margin: 4px 0 2px; font-size: 24px; letter-spacing: 0.04em; text-transform: uppercase; }
+        .desc { margin: 0 0 12px; font-size: 14px; color: var(--muted); }
+        #fallback pre { white-space: pre-wrap; font-family: 'Share Tech Mono', monospace; font-size: 12px; color: var(--danger); background: rgba(0,0,0,0.4); padding: 10px; margin: 10px 0 0; max-height: 40vh; overflow: auto; }
+        @media (max-width: 700px) { #help, #tools { display: none; } #hud { font-size: 10px; min-width: 0; } }
+    </style>
+</head>
+<body>
+    <canvas id="view"></canvas>
+    <canvas id="labels"></canvas>
+    <div id="hud" class="panel"></div>
+    <div id="help" class="panel"></div>
+    <div id="tools" class="panel"></div>
+    <div id="toast" class="panel"></div>
+    <div id="fallback">
+        <div class="card">
+            <div class="tag">SYSTEM FAULT</div>
+            <h1>WebGPU unavailable</h1>
+            <p class="desc">This demo needs WebGPU (Chrome/Edge 113+, or Brave with WebGPU enabled in brave://flags).</p>
+            <pre id="error-message">navigator.gpu is undefined</pre>
+        </div>
+    </div>
+
+<!--
+  Scenario: the whole world as data. Positions are metres, [x, z] on the map (x east, z south, map centred on 0).
+    terrain   size (m), resolution (cells per side = flow sim grid), base height
+    sim       flow solver: stepsPerFrame, stepTime (s per step), gravity, diffusion, linDamping, sqrDamping, cfl, turbulenceSpeed,
+              absorption, evaporation (mm/h), friction{Min,Max}Depth, frictionAmount, minDepth, wetDecay, warmup, edges (open | closed)
+    waves     surface wave cascades around the camera: speed (m/s), damping, noise, foam, layers [{ size, resolution, height }]
+    water     look: deep [rgb], absorb [rgb per m], refraction, foam, detail, flowScale
+    entities  { type, id, label, ... }, type in ENTITY_TYPES, applied in order:
+              terrain  tilt { dir, drop } | hills { amplitude, scale, octaves, seed, ridged } | mountain { pos, radius, height, roughness }
+                       valley { path, width, channel, bank, levels [from, to], wiggle } | basin { pos, radius, floor } | coast { dir, at, width, floor }
+                       dam { from, to, crest, top, side, spillway { width, depth }, gap { at, width }, breachTime }
+              water    sea { level } | lake { pos, level } | spring { pos, rate m3/s, radius } | rain { rate mm/h, pos?, radius?, enabled }
+                       drain { pos, rate m3/s, radius } | debris { pos, radius, count, size, color, life }
+    tools     { type (pour drain raise dig splash), key, ... } applied with the right mouse button
+    lighting  named presets: sun { azimuth, elevation, color, intensity }, sky { top, horizon }, ground, ambient, fog, exposure
+    views     { name, pos [x, y, z], look [x, y, z] }
+-->
+<script type="application/json" id="scenario">
+{
+    "name": "Riverlands",
+    "terrain": { "size": 2048, "resolution": 512, "base": 80, "snowLine": 250 },
+    "sim": {
+        "stepsPerFrame": 32, "stepTime": 0.12, "gravity": 9.81, "diffusion": 0.06,
+        "linDamping": 0.99, "sqrDamping": 0.05, "absorption": 1.0, "evaporation": 10.0,
+        "frictionMinDepth": 0.0, "frictionMaxDepth": 1.0, "frictionAmount": 0.9,
+        "minDepth": 0.03, "wetDecay": 0.9998, "warmup": 24000, "edges": "open", "cfl": 0.3, "turbulenceSpeed": 8
+    },
+    "waves": {
+        "speed": 5.0, "damping": 0.985, "noise": 1.0, "foam": 1.0,
+        "layers": [
+            { "size": 192, "resolution": 512, "height": 0.07 },
+            { "size": 768, "resolution": 512, "height": 0.22 }
+        ]
+    },
+    "water": {
+        "deep": [0.030, 0.085, 0.080], "absorb": [0.38, 0.13, 0.11], "refraction": 0.035,
+        "foam": 1.0, "detail": 1.0, "flowScale": 3.0
+    },
+
+    "entities": [
+        { "type": "tilt", "dir": [0, 1], "drop": 110 },
+        { "type": "hills", "amplitude": 26, "scale": 520, "octaves": 5, "seed": 7 },
+        { "type": "hills", "amplitude": 7, "scale": 90, "octaves": 3, "seed": 21, "ridged": true },
+        { "type": "mountain", "id": "north-peak", "label": "Stormhorn", "pos": [-560, -820], "radius": 520, "height": 270, "roughness": 0.45 },
+        { "type": "mountain", "pos": [380, -900], "radius": 460, "height": 220, "roughness": 0.5 },
+        { "type": "mountain", "pos": [920, -380], "radius": 380, "height": 150, "roughness": 0.5 },
+        { "type": "mountain", "pos": [-960, 60], "radius": 360, "height": 120, "roughness": 0.4 },
+        { "type": "mountain", "pos": [760, 520], "radius": 340, "height": 90, "roughness": 0.4 },
+        { "type": "mountain", "pos": [40, 80], "radius": 620, "height": 30, "roughness": 0.2 },
+        { "type": "coast", "dir": [0.15, 1], "at": 760, "width": 200, "floor": -14 },
+        { "type": "basin", "id": "lake-bed", "pos": [40, 70], "radius": 290, "floor": 30, "rim": 72, "rimWidth": 170 },
+        { "type": "valley", "id": "upper-river", "path": [[-470, -700], [-330, -520], [-410, -330], [-220, -170], [-60, -40]],
+          "width": 18, "channel": 4, "bank": 70, "levels": [170, 58], "wiggle": 18 },
+        { "type": "valley", "id": "east-creek", "path": [[520, -700], [390, -500], [240, -330], [70, -150], [20, -60]],
+          "width": 12, "channel": 3, "bank": 55, "levels": [100, 60], "wiggle": 14 },
+        { "type": "valley", "id": "lower-river", "path": [[100, 200], [150, 320], [270, 480], [140, 640], [230, 840], [200, 1060]],
+          "width": 22, "channel": 4, "bank": 80, "levels": [50, -8], "wiggle": 16 },
+        { "type": "dam", "id": "dam", "label": "Dam (X: breach)", "from": [30, 430], "to": [290, 300], "crest": 66, "top": 8, "side": 1.6,
+          "spillway": { "width": 22, "depth": 2.5 }, "gap": { "at": 0.52, "width": 46 }, "breachTime": 12 },
+
+        { "type": "sea", "label": "Sea", "level": 2, "labelPos": [-300, 930] },
+        { "type": "lake", "id": "lake", "label": "Lake", "pos": [40, 70], "level": 63 },
+        { "type": "spring", "id": "spring-west", "label": "West spring", "pos": [-470, -700], "rate": 40, "radius": 18 },
+        { "type": "spring", "id": "spring-east", "label": "East spring", "pos": [520, -700], "rate": 30, "radius": 14 },
+        { "type": "spring", "label": "Cliff spring", "pos": [-880, -230], "rate": 8, "radius": 10 },
+        { "type": "rain", "label": "", "rate": 60, "enabled": false },
+        { "type": "drain", "label": "Sinkhole", "pos": [-850, -170], "rate": 5, "radius": 12 },
+        { "type": "debris", "label": "", "pos": [-330, -520], "radius": 30, "count": 500, "size": 2.6, "color": [0.36, 0.24, 0.14], "life": 900 },
+        { "type": "debris", "label": "", "pos": [390, -500], "radius": 20, "count": 300, "size": 1.8, "color": [0.30, 0.34, 0.16], "life": 900 },
+        { "type": "debris", "label": "", "pos": [200, 520], "radius": 24, "count": 400, "size": 2.2, "color": [0.40, 0.28, 0.16], "life": 900 }
+    ],
+
+    "tools": [
+        { "type": "pour",   "key": "1", "rate": 40 },
+        { "type": "splash", "key": "2", "strength": 0.9 },
+        { "type": "raise",  "key": "3", "rate": 6 },
+        { "type": "dig",    "key": "4", "rate": 6 },
+        { "type": "drain",  "key": "5", "rate": 40 }
+    ],
+
+    "lighting": {
+        "start": "day",
+        "day":      { "sun": { "azimuth": 150, "elevation": 38, "color": [1.0, 0.95, 0.86], "intensity": 3.2 },
+                      "sky": { "top": [0.22, 0.42, 0.78], "horizon": [0.62, 0.74, 0.86] }, "ground": [0.24, 0.22, 0.18],
+                      "ambient": 0.55, "fog": 0.00022, "exposure": 0.6 },
+        "golden":   { "sun": { "azimuth": 250, "elevation": 9, "color": [1.0, 0.62, 0.32], "intensity": 3.0 },
+                      "sky": { "top": [0.16, 0.26, 0.52], "horizon": [0.92, 0.62, 0.42] }, "ground": [0.22, 0.16, 0.12],
+                      "ambient": 0.45, "fog": 0.00030, "exposure": 0.7 },
+        "overcast": { "sun": { "azimuth": 120, "elevation": 55, "color": [0.9, 0.92, 0.95], "intensity": 0.9 },
+                      "sky": { "top": [0.46, 0.50, 0.56], "horizon": [0.62, 0.65, 0.68] }, "ground": [0.26, 0.26, 0.25],
+                      "ambient": 1.0, "fog": 0.00045, "exposure": 0.75 }
+    },
+
+    "views": [
+        { "name": "Overview",     "pos": [-820, 420, 1020], "look": [60, 40, -60] },
+        { "name": "Dam & lake",   "pos": [300, 110, 560],  "look": [120, 55, 300] },
+        { "name": "Upper river",  "pos": [-520, 180, -160], "look": [-360, 110, -440] },
+        { "name": "Delta",        "pos": [520, 90, 1000],  "look": [200, 0, 820] },
+        { "name": "Lake shore",   "pos": [-160, 80, 220],  "look": [60, 60, 20] }
+    ]
+}
+</script>
+
+<script>
+'use strict';
+// =====================================================================================================
+// Entity Water: a GPU shallow-water river simulation over a heightmap, after Filip Strugar's RiverSim
+// (github.com/fstrugar/riversim), rebuilt as one static WebGPU page.
+//
+//   1. Flow sim (per step, compute): virtual-pipe style diffusion + acceleration along the water surface
+//      gradient (8 neighbours), RiverSim's velocity regulation (linear / quadratic / depth-based friction),
+//      water sources, then mass-conserving forward advection of depth and momentum by the velocity field.
+//   2. Surface waves (per frame, compute): finite-difference wave maps in cascades that follow the camera,
+//      advected by the flow velocity, excited by flow turbulence, plus an advected foam map.
+//   3. Render: terrain (soft heightfield shadows, wet banks, caustics), then water with screen-space
+//      refraction, depth absorption, sky reflection, flow-mapped detail normals and foam.
+//
+// The world is data (the scenario JSON above). Every entity is a class in ENTITY_TYPES: terrain features
+// stamp the heightmap, water entities fill lakes, add sources / sinks, or emit floating debris.
+// =====================================================================================================
+
+// ------------------------------------------------------------------------------------------------ config
+const DEG = Math.PI / 180;
+const NEAR = 0.5;
+const MAX_SOURCES = 128;
+const MAX_LAYERS = 4;
+const MAX_PARTICLES = 16384;
+const SOURCE_FLOATS = 8;
+const FRAME_FLOATS = 112;
+const RENDER_MODES = ['shaded', 'depth', 'velocity', 'foam / turbulence', 'wave cascades'];
+const SIM_DEFAULTS = {
+    stepsPerFrame: 32, stepTime: 0.12, gravity: 9.81, acceleration: null, diffusion: 0.06, linDamping: 0.99, sqrDamping: 0.05,
+    absorption: 1, evaporation: 0, frictionMinDepth: 0, frictionMaxDepth: 1, frictionAmount: 0.9,
+    minDepth: 0.03, wetDecay: 0.9998, warmup: 12000, edges: 'open', cfl: 0.3, turbulenceSpeed: 8,
+};
+const WAVE_DEFAULTS = { speed: 5, damping: 0.985, noise: 1, foam: 1, layers: [] };
+const WATER_DEFAULTS = { deep: [0.03, 0.085, 0.08], absorb: [0.38, 0.13, 0.11], refraction: 0.035, foam: 1, detail: 1, flowScale: 3 };
+
+// -------------------------------------------------------------------------------------------------- math
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+const v3 = {
+    add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+    sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+    mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
+    dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+    cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+    len: a => Math.hypot(a[0], a[1], a[2]),
+    norm: a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+};
+
+// column-major 4x4
+const m4 = {
+    mul(a, b) {
+        const o = new Float32Array(16);
+        for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+            let s = 0;
+            for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+            o[c * 4 + r] = s;
+        }
+        return o;
+    },
+    // rows: right, up, back
+    view(eye, r, u, f) {
+        const b = [-f[0], -f[1], -f[2]];
+        return new Float32Array([r[0], u[0], b[0], 0, r[1], u[1], b[1], 0, r[2], u[2], b[2], 0,
+            -v3.dot(r, eye), -v3.dot(u, eye), -v3.dot(b, eye), 1]);
+    },
+    // reversed-Z, infinite far plane: depth = near / view distance
+    reversedInfinite(fovy, aspect, near) {
+        const f = 1 / Math.tan(fovy / 2);
+        return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, near, 0]);
+    },
+    project(m, p) {
+        return [0, 1, 2, 3].map(r => m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r]);
+    },
+};
+
+function mulberry32(seed) {
+    let a = seed >>> 0;
+    return () => {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// -------------------------------------------------------------------------------------------------- noise
+function hash2(ix, iy, seed) {
+    let h = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(seed, 1442695041)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+}
+
+function vnoise(x, y, seed) {
+    const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const a = hash2(ix, iy, seed), b = hash2(ix + 1, iy, seed), c = hash2(ix, iy + 1, seed), d = hash2(ix + 1, iy + 1, seed);
+    return lerp(lerp(a, b, ux), lerp(c, d, ux), uy) * 2 - 1;
+}
+
+// fractal noise in about [-1, 1]; ridged gives sharp crests in [0, 1]
+function fbm(x, y, { octaves = 5, seed = 1, ridged = false, gain = 0.5 } = {}) {
+    let sum = 0, amp = 1, norm = 0, f = 1;
+    for (let o = 0; o < octaves; o++) {
+        const n = vnoise(x * f + o * 17.3, y * f - o * 9.1, seed + o * 31);
+        sum += (ridged ? 1 - Math.abs(n) : n) * amp;
+        norm += amp;
+        amp *= gain;
+        f *= 2.03;
+    }
+    return sum / norm;
+}
+
+// nearest point on a polyline: { dist, s (arc length at that point), total }
+function polylineNearest(pts, lens, x, z) {
+    let best = Infinity, bs = 0;
+    for (let k = 0; k < pts.length - 1; k++) {
+        const [ax, az] = pts[k], [bx, bz] = pts[k + 1], dx = bx - ax, dz = bz - az;
+        const l2 = dx * dx + dz * dz || 1;
+        const t = clamp(((x - ax) * dx + (z - az) * dz) / l2, 0, 1);
+        const px = ax + dx * t - x, pz = az + dz * t - z, d = px * px + pz * pz;
+        if (d < best) { best = d; bs = lens[k] + t * Math.sqrt(l2); }
+    }
+    return { dist: Math.sqrt(best), s: bs };
+}
+
+function polylineLengths(pts) {
+    const lens = [0];
+    for (let k = 1; k < pts.length; k++) lens.push(lens[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
+    return lens;
+}
+
+// ----------------------------------------------------------------------------------------- heightfield
+// CPU copy of the terrain: authored by entities, edited by tools, uploaded to the GPU by dirty rectangle.
+// Cell (i, j) centre sits at (origin + (i + 0.5) * cell, origin + (j + 0.5) * cell); i runs along x, j along z.
+class Heightfield {
+    constructor(size, n, base) {
+        this.size = size;
+        this.n = n;
+        this.cell = size / n;
+        this.origin = -size / 2;
+        this.h = new Float32Array(n * n).fill(base);
+        this.dirty = null;
+        this.min = base;
+        this.max = base;
+    }
+
+    cx(i) { return this.origin + (i + 0.5) * this.cell; }
+    ci(x) { return (x - this.origin) / this.cell - 0.5; }
+
+    // calls fn(idx, x, z, i, j) for every cell centre inside the world-space box
+    each(x0, z0, x1, z1, fn) {
+        const n = this.n;
+        const i0 = clamp(Math.floor(this.ci(x0)), 0, n - 1), i1 = clamp(Math.ceil(this.ci(x1)), 0, n - 1);
+        const j0 = clamp(Math.floor(this.ci(z0)), 0, n - 1), j1 = clamp(Math.ceil(this.ci(z1)), 0, n - 1);
+        for (let j = j0; j <= j1; j++) {
+            const z = this.cx(j);
+            for (let i = i0; i <= i1; i++) fn(j * n + i, this.cx(i), z, i, j);
+        }
+        return { i0, j0, i1, j1 };
+    }
+
+    eachAll(fn) { return this.each(-Infinity, -Infinity, Infinity, Infinity, fn); }
+
+    sample(x, z) {
+        const n = this.n, fx = clamp(this.ci(x), 0, n - 1), fz = clamp(this.ci(z), 0, n - 1);
+        const i = Math.min(Math.floor(fx), n - 2), j = Math.min(Math.floor(fz), n - 2), tx = fx - i, tz = fz - j, h = this.h;
+        const a = h[j * n + i], b = h[j * n + i + 1], c = h[(j + 1) * n + i], d = h[(j + 1) * n + i + 1];
+        return lerp(lerp(a, b, tx), lerp(c, d, tx), tz);
+    }
+
+    touch(r) {
+        const d = this.dirty;
+        this.dirty = d ? { i0: Math.min(d.i0, r.i0), j0: Math.min(d.j0, r.j0), i1: Math.max(d.i1, r.i1), j1: Math.max(d.j1, r.j1) } : { ...r };
+    }
+
+    updateRange() {
+        let lo = Infinity, hi = -Infinity;
+        for (const v of this.h) { if (v < lo) lo = v; if (v > hi) hi = v; }
+        this.min = lo;
+        this.max = hi;
+    }
+
+    // smooth bump (amount > 0) or dent (amount < 0) of radius r
+    brush(x, z, r, amount) {
+        const rect = this.each(x - r, z - r, x + r, z + r, (idx, cx, cz) => {
+            const d = Math.hypot(cx - x, cz - z) / r;
+            if (d < 1) this.h[idx] += amount * (1 - d * d) * (1 - d * d);
+        });
+        this.touch(rect);
+        this.max = Math.max(this.max, this.h.reduce((m, v) => v > m ? v : m, -Infinity));
+    }
+
+    // first hit of a ray with the heightfield, or null
+    raycast(o, d, maxDist = 9000) {
+        let t = 0, prev = 0;
+        const above = t => { const p = v3.add(o, v3.mul(d, t)); return p[1] - this.sample(p[0], p[2]); };
+        if (above(0) < 0) return null;
+        while (t < maxDist) {
+            const step = Math.max(this.cell * 0.5, t * 0.004);
+            prev = t;
+            t += step;
+            const p = v3.add(o, v3.mul(d, t));
+            if (Math.abs(p[0]) > this.size * 0.75 || Math.abs(p[2]) > this.size * 0.75) { if (p[1] < this.min) return null; continue; }
+            if (above(t) < 0) {
+                let a = prev, b = t;
+                for (let k = 0; k < 20; k++) { const m = (a + b) / 2; if (above(m) < 0) b = m; else a = m; }
+                return v3.add(o, v3.mul(d, b));
+            }
+        }
+        return null;
+    }
+}
+
+// 4-connected flood fill of every cell below `level` reachable from the seeds; sets depth to the level
+function floodFill(field, water, seeds, level) {
+    const n = field.n, h = field.h, seen = new Uint8Array(n * n), stack = [];
+    for (const s of seeds) if (h[s] < level && !seen[s]) { seen[s] = 1; stack.push(s); }
+    let count = 0;
+    while (stack.length) {
+        const idx = stack.pop(), i = idx % n, j = (idx - i) / n;
+        water[idx] = Math.max(water[idx], level - h[idx]);
+        count++;
+        const nb = [i > 0 ? idx - 1 : -1, i < n - 1 ? idx + 1 : -1, j > 0 ? idx - n : -1, j < n - 1 ? idx + n : -1];
+        for (const q of nb) if (q >= 0 && !seen[q] && h[q] < level) { seen[q] = 1; stack.push(q); }
+    }
+    return count;
+}
+
+// =====================================================================================================
+// WGSL
+// =====================================================================================================
+
+// ------------------------------------------------------------------------------------------ WGSL flow sim
+// State texture (rgba32float): depth (m), velocity (cells per step, x and z), wet (recently wet, 0..1).
+const WGSL_FLOW = /* wgsl */`
+struct Sim {
+    n: i32, sourceCount: u32, edgeMode: u32, frame: u32,
+    cell: f32, stepTime: f32, diffusion: f32, acceleration: f32,
+    linDamp: f32, sqrDamp: f32, absorption: f32, rain: f32,
+    fricMin: f32, fricMax: f32, fricAmount: f32, seaLevel: f32,
+    minDepth: f32, wetDecay: f32, evaporation: f32, velScale: f32,
+    cfl: f32, turbulenceSpeed: f32, _p2: f32, _p3: f32,
+}
+struct Source { a: vec4f, b: vec4f }     // a: centre (cells), radius (cells), depth per step at the centre (< 0: sink); b.x: flat profile
+
+@group(0) @binding(0) var<uniform> S: Sim;
+@group(0) @binding(1) var terrainTex: texture_2d<f32>;
+@group(0) @binding(2) var stateIn: texture_2d<f32>;
+@group(0) @binding(3) var stateOut: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(4) var<storage, read> sources: array<Source>;
+@group(0) @binding(5) var surfOut: texture_storage_2d<rg32float, write>;
+@group(0) @binding(6) var flowOut: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(7) var<storage, read_write> stats: array<atomic<u32>, 4>;
+
+var<private> OFFS: array<vec2i, 8> = array<vec2i, 8>(
+    vec2i(-1, 0), vec2i(1, 0), vec2i(0, -1), vec2i(0, 1),
+    vec2i(-1, -1), vec2i(1, 1), vec2i(1, -1), vec2i(-1, 1));
+
+fn inside(p: vec2i) -> bool { return p.x >= 0 && p.y >= 0 && p.x < S.n && p.y < S.n; }
+fn H(p: vec2i) -> f32 { return textureLoad(terrainTex, p, 0).x; }
+fn ST(p: vec2i) -> vec4f { return textureLoad(stateIn, p, 0); }
+
+// RiverSim: cap at 0.499 cells per step, linear and quadratic damping, more friction in shallow water
+fn regulate(v: vec2f, depth: f32, min9: f32) -> vec2f {
+    let l = length(v) + 1e-5;
+    var ln = min(l, 0.499);
+    let range = max(S.fricMax - S.fricMin, 1e-4);
+    let kc = clamp((depth - S.fricMin) / range, 0.0, 1.0);
+    let k9 = clamp((min9 - S.fricMin) / range, 0.0, 1.0);
+    ln *= S.linDamp * mix(S.fricAmount * S.fricAmount, 1.0, kc) * mix(S.fricAmount, 1.0, k9);
+    let ld = ln * S.sqrDamp;
+    ln -= ld * ld;
+    return v * (max(ln, 0.0) / l);
+}
+
+// step 1: exchange water with the 8 neighbours along the surface gradient, accelerate, add sources
+@compute @workgroup_size(8, 8)
+fn simulate(@builtin(global_invocation_id) gid: vec3u) {
+    let p = vec2i(gid.xy);
+    if (!inside(p)) { return; }
+    let c = ST(p);
+    let hc = H(p);
+    let sc = hc + c.x;
+    var dsum = 0.0;
+    var vadd = vec2f(0.0);
+    var min9 = c.x;
+    var max9 = c.x;
+    for (var k = 0; k < 8; k++) {
+        let o = OFFS[k];
+        let q = p + o;
+        if (!inside(q)) { continue; }
+        let s = ST(q);
+        min9 = min(min9, s.x);
+        max9 = max(max9, s.x);
+        // antisymmetric between the pair, so the exchange conserves mass
+        let d = clamp(H(q) + s.x - sc, -c.x, s.x);
+        let diag = k >= 4;
+        dsum += d * select(1.0, 0.70710678, diag);
+        vadd -= vec2f(o) * (d * select(1.0, 0.35355339, diag));
+    }
+    var depth = c.x + S.diffusion * dsum;
+    // gravity waves travel ~sqrt(acceleration * depth / cell) cells per step: cap that for deep water (lakes)
+    let accel = min(S.acceleration, S.cfl * S.cell / max(max9, 1e-3));
+    var vel = c.yz + vadd * (accel / S.cell);
+    vel = regulate(vel, depth, min9);
+    vel *= clamp((depth - 1e-6) * 1e7, 0.0, 1.0);
+
+    let pc = vec2f(p);
+    var add = S.rain;
+    var sink = 0.0;
+    for (var i = 0u; i < S.sourceCount; i++) {
+        let src = sources[i];
+        let r = length(pc - src.a.xy) / src.a.z;
+        if (r >= 1.0) { continue; }
+        let prof = select(sqrt(1.0 - r), 1.0, src.b.x > 0.5);
+        if (src.a.w >= 0.0) { add += src.a.w * prof; } else { sink -= src.a.w * prof; }
+    }
+    depth = max(0.0, depth * S.absorption + add - sink - S.evaporation);
+
+    let border = p.x == 0 || p.y == 0 || p.x == S.n - 1 || p.y == S.n - 1;
+    if (border && S.edgeMode == 1u) { depth = 0.0; vel = vec2f(0.0); }
+    if (border && S.edgeMode == 2u) { depth = max(0.0, S.seaLevel - hc); }
+    textureStore(stateOut, p, vec4f(depth, vel, c.w));
+}
+
+// step 2: move depth and momentum by the velocity; every neighbour's water lands on a bilinear footprint
+@compute @workgroup_size(8, 8)
+fn propagate(@builtin(global_invocation_id) gid: vec3u) {
+    let p = vec2i(gid.xy);
+    if (!inside(p)) { return; }
+    var depth = 0.0;
+    var mom = vec2f(0.0);
+    var avg = vec2f(0.0);
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let q = p + vec2i(dx, dy);
+            if (!inside(q)) { continue; }
+            let s = ST(q);
+            let off = vec2f(f32(dx), f32(dy)) + s.yz;
+            let nd = max(vec2f(1.0) - abs(off), vec2f(0.0));
+            let cd = nd.x * nd.y * s.x;
+            depth += cd;
+            mom += s.yz * cd;
+            avg += s.yz;
+        }
+    }
+    var vel = mom / (depth + 1e-6);
+    vel = (vel * 25.0 + avg) / 34.0;
+    let c = ST(p);
+    let wet = max(c.w * S.wetDecay, select(0.0, 1.0, depth > S.minDepth));
+    textureStore(stateOut, p, vec4f(depth, vel, wet));
+}
+
+// once per frame: render inputs (surface extended one cell over dry banks, velocity in m/s, turbulence) and stats
+var<workgroup> wgVol: atomic<u32>;
+var<workgroup> wgWet: atomic<u32>;
+var<workgroup> wgMax: atomic<u32>;
+
+@compute @workgroup_size(8, 8)
+fn info(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
+    let p = vec2i(gid.xy);
+    if (inside(p)) {
+        let s = ST(p);
+        let h = H(p);
+        let wetCell = s.x > S.minDepth;
+        var surf = h + s.x;
+        if (!wetCell) {
+            var sum = 0.0;
+            var cnt = 0.0;
+            for (var k = 0; k < 8; k++) {
+                let q = p + OFFS[k];
+                if (!inside(q)) { continue; }
+                let t = ST(q);
+                if (t.x > S.minDepth) { sum += H(q) + t.x; cnt += 1.0; }
+            }
+            surf = select(-1e5, sum / max(cnt, 1.0), cnt > 0.0);
+        }
+        let speed = length(s.yz);
+        let range = max(S.fricMax - S.fricMin, 1e-4);
+        let pm = pow(mix(S.fricAmount, 1.0, clamp((s.x - S.fricMin) / range, 0.0, 1.0)), 4.0);
+        let pert = clamp(speed * S.velScale / S.turbulenceSpeed / pm, 0.0, 1.0);
+        let w = select(0.0, 1.0, wetCell);
+        textureStore(surfOut, p, vec4f(surf, s.w, 0.0, 0.0));
+        textureStore(flowOut, p, vec4f(s.x * w, s.yz * S.velScale * w, pert * w));
+        atomicAdd(&wgVol, u32(s.x * S.cell * S.cell * 10.0));
+        if (wetCell) {
+            atomicAdd(&wgWet, 1u);
+            atomicMax(&wgMax, bitcast<u32>(speed * S.velScale));
+        }
+    }
+    workgroupBarrier();
+    if (li == 0u) {
+        atomicAdd(&stats[0], atomicLoad(&wgVol));
+        atomicAdd(&stats[1], atomicLoad(&wgWet));
+        atomicMax(&stats[2], atomicLoad(&wgMax));
+    }
+}
+`;
+
+// ------------------------------------------------------------------------------------------ WGSL waves
+// One cascade layer: a res x res wave map (height, previous height, foam) centred on the camera.
+const WGSL_WAVES = /* wgsl */`
+struct Wave {
+    origin: vec2f, texel: f32, res: i32,
+    shift: vec2f, dt: f32, damping: f32,
+    mapOrigin: vec2f, mapSize: f32, step: u32,
+    noise: f32, foamGain: f32, minDepth: f32, heightScale: f32,
+    splash: vec4f,
+}
+@group(0) @binding(0) var<uniform> W: Wave;
+@group(0) @binding(1) var stateIn: texture_2d<f32>;
+@group(0) @binding(2) var stateOut: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(3) var flowTex: texture_2d<f32>;
+@group(0) @binding(4) var samp: sampler;
+@group(0) @binding(5) var dispOut: texture_storage_2d<rgba16float, write>;
+
+fn ld(p: vec2i) -> vec4f {
+    if (p.x < 0 || p.y < 0 || p.x >= W.res || p.y >= W.res) { return vec4f(0.0); }
+    return textureLoad(stateIn, p, 0);
+}
+fn smp(x: vec2f) -> vec4f {
+    let q = x - 0.5;
+    let i = vec2i(floor(q));
+    let f = q - floor(q);
+    return mix(mix(ld(i), ld(i + vec2i(1, 0)), f.x), mix(ld(i + vec2i(0, 1)), ld(i + vec2i(1, 1)), f.x), f.y);
+}
+fn hash(p: vec2u, s: u32) -> f32 {
+    var h = p.x * 1664525u + p.y * 1013904223u + s * 2654435761u;
+    h ^= h >> 16u; h *= 2246822519u; h ^= h >> 13u; h *= 3266489917u; h ^= h >> 16u;
+    return f32(h) / 4294967295.0;
+}
+
+@compute @workgroup_size(8, 8)
+fn waveStep(@builtin(global_invocation_id) gid: vec3u) {
+    let p = vec2i(gid.xy);
+    if (p.x >= W.res || p.y >= W.res) { return; }
+    let world = W.origin + (vec2f(p) + 0.5) * W.texel;
+    let fl = textureSampleLevel(flowTex, samp, (world - W.mapOrigin) / W.mapSize, 0.0);
+    // semi-Lagrangian: fetch last step's state upstream (and from where this texel was before the layer moved)
+    let src = vec2f(p) + 0.5 + W.shift - fl.yz * (W.dt / W.texel);
+    let c = smp(src);
+    let h1 = smp(src + vec2f(0.0, -1.0)).x;
+    let h3 = smp(src + vec2f(-1.0, 0.0)).x;
+    let h5 = smp(src + vec2f(1.0, 0.0)).x;
+    let h7 = smp(src + vec2f(0.0, 1.0)).x;
+    var k = (h1 + h3 + h5 + h7) * 0.5 - c.y;
+    // sparse impulses, stronger where the flow is turbulent
+    let r = hash(vec2u(p), W.step) * 2.0 - 1.0;
+    let nz = r * (fl.w + 0.2) * 1.3;
+    k += clamp(pow(abs(nz), 5.0) * 0.35 * sign(nz) * pow(W.damping, 16.0), -0.35, 0.35) * W.noise;
+    k *= W.damping;
+    let edge = smoothstep(W.minDepth, W.minDepth + 0.8, fl.x);
+    k = clamp(k * edge, -1.0, 1.0);
+    if (W.splash.z > 0.0) {
+        let d = length(world - W.splash.xy);
+        if (d < W.splash.z) { k = clamp(k - W.splash.w * (1.0 - d / W.splash.z) * edge, -1.0, 1.0); }
+    }
+
+    // foam: made by steep wave fronts and turbulence, carried by the flow, slowly dissolving
+    let a = smp(src + vec2f(-3.0, -1.0)).x;
+    let b = smp(src + vec2f(1.0, -3.0)).x;
+    let cc = smp(src + vec2f(3.0, 1.0)).x;
+    let dd = smp(src + vec2f(-1.0, 3.0)).x;
+    let delta = abs(a - cc) + abs(b - dd);
+    let fc = max(0.0, sin(delta * 50.0)) * step(0.2, delta);
+    let n1 = hash(vec2u(p), W.step / 8u);
+    let n2 = hash(vec2u(p) + 7u, W.step / 8u + 3u);
+    let nf = clamp((pow(n1 * n2 - 0.2, 2.0) + 0.02) * 10.0, 0.0, 1.0);
+    let fadd = (fc * 0.5 + clamp(fl.w - 0.6, 0.0, 1.0)) * 0.08 * W.foamGain * nf * edge;
+    let foam = clamp((c.z + fadd) * 0.95 - 0.002, 0.0, 1.0);
+    textureStore(stateOut, p, vec4f(k, c.x, foam, 0.0));
+}
+
+// sharper crests, as in RiverSim's combined height map
+fn shapeH(h: f32) -> f32 { return h + pow(abs(h), 3.0) * 0.3; }
+
+@compute @workgroup_size(8, 8)
+fn waveDisplay(@builtin(global_invocation_id) gid: vec3u) {
+    let p = vec2i(gid.xy);
+    if (p.x >= W.res || p.y >= W.res) { return; }
+    let c = ld(p);
+    let hl = shapeH(ld(p - vec2i(1, 0)).x);
+    let hr = shapeH(ld(p + vec2i(1, 0)).x);
+    let hu = shapeH(ld(p - vec2i(0, 1)).x);
+    let hd = shapeH(ld(p + vec2i(0, 1)).x);
+    let g = vec2f(hr - hl, hd - hu) * (W.heightScale / (2.0 * W.texel));
+    textureStore(dispOut, p, vec4f(shapeH(c.x) * W.heightScale, g, c.z));
+}
+`;
+
+// ------------------------------------------------------------------------------------------ WGSL debris
+const WGSL_DEBRIS_SIM = /* wgsl */`
+struct Deb { dt: f32, time: f32, count: u32, n: i32, mapOrigin: vec2f, cell: f32, minDepth: f32 }
+struct Particle { p: vec4f, q: vec4f }     // p: position, age; q: heading, dry time, emitter, seed
+struct Emitter { a: vec4f, b: vec4f }      // a: x, z, radius, life; b: colour, size
+@group(0) @binding(0) var<uniform> U: Deb;
+@group(0) @binding(1) var<storage, read_write> parts: array<Particle>;
+@group(0) @binding(2) var<storage, read> emitters: array<Emitter>;
+@group(0) @binding(3) var flowTex: texture_2d<f32>;
+@group(0) @binding(4) var samp: sampler;
+@group(0) @binding(5) var surfTex: texture_2d<f32>;
+@group(0) @binding(6) var terrainTex: texture_2d<f32>;
+
+fn rnd(s: ptr<function, u32>) -> f32 {
+    *s = *s * 747796405u + 2891336453u;
+    var w = ((*s >> ((*s >> 28u) + 4u)) ^ *s) * 277803737u;
+    w = (w >> 22u) ^ w;
+    return f32(w) / 4294967295.0;
+}
+fn cellLoad(t: texture_2d<f32>, p: vec2i) -> vec2f { return textureLoad(t, clamp(p, vec2i(0), vec2i(U.n - 1)), 0).xy; }
+fn height(xz: vec2f) -> f32 {
+    let c = (xz - U.mapOrigin) / U.cell - 0.5;
+    let i = vec2i(floor(c));
+    let f = c - floor(c);
+    var s = array<f32, 4>();
+    for (var k = 0; k < 4; k++) {
+        let q = i + vec2i(k & 1, k >> 1);
+        let sv = cellLoad(surfTex, q).x;
+        s[k] = select(sv, cellLoad(terrainTex, q).x, sv < -1e4);
+    }
+    return mix(mix(s[0], s[1], f.x), mix(s[2], s[3], f.x), f.y);
+}
+
+@compute @workgroup_size(64)
+fn updateDebris(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= U.count) { return; }
+    var pt = parts[i];
+    let e = emitters[u32(pt.q.z)];
+    let size = U.cell * f32(U.n);
+    let fl = textureSampleLevel(flowTex, samp, (pt.p.xz - U.mapOrigin) / size, 0.0);
+    if (fl.x > max(U.minDepth * 2.0, e.b.w * 0.1)) {
+        pt.p.x += fl.y * U.dt;
+        pt.p.z += fl.z * U.dt;
+        let sp = length(fl.yz);
+        if (sp > 0.05) {
+            let heading = atan2(fl.z, fl.y);
+            var dh = heading - pt.q.x;
+            dh = dh - 6.2831853 * round(dh / 6.2831853);
+            pt.q.x += dh * min(1.0, U.dt * 0.6);
+        }
+        pt.q.x += sin(U.time * 0.7 + pt.q.w * 40.0) * U.dt * 0.15;
+        // a little random walk; logs caught in still water count as stranded after a while
+        let j = vec2f(sin(U.time * 1.3 + pt.q.w * 91.0), cos(U.time * 1.1 + pt.q.w * 57.0));
+        pt.p.x += j.x * U.dt * 0.4;
+        pt.p.z += j.y * U.dt * 0.4;
+        pt.q.y = select(0.0, pt.q.y + U.dt * 0.1, sp < 0.2);
+    } else {
+        pt.q.y += U.dt;
+    }
+    pt.p.w += U.dt;
+    let rel = (pt.p.xz - U.mapOrigin) / size;
+    let out = any(rel < vec2f(0.005)) || any(rel > vec2f(0.995));
+    if (pt.p.w > e.a.w || pt.q.y > 4.0 || out) {
+        // respawn at the deepest of a few random spots around the emitter
+        var s = i * 9781u + u32(U.time * 1000.0) * 6271u + 1u;
+        var best = vec3f(e.a.xy, -1.0);
+        for (var k = 0; k < 6; k++) {
+            let a = rnd(&s) * 6.2831853;
+            let r = sqrt(rnd(&s)) * e.a.z;
+            let c = e.a.xy + vec2f(cos(a), sin(a)) * r;
+            let d = textureSampleLevel(flowTex, samp, (c - U.mapOrigin) / size, 0.0).x;
+            if (d > best.z) { best = vec3f(c, d); }
+        }
+        pt.p = vec4f(best.x, 0.0, best.y, 0.0);
+        pt.q = vec4f(rnd(&s) * 6.2831853, 0.0, pt.q.z, rnd(&s));
+    }
+    pt.p.y = height(pt.p.xz) + e.b.w * 0.08 + sin(U.time * 1.7 + pt.q.w * 30.0) * 0.05;
+    parts[i] = pt;
+}
+`;
+
+// ------------------------------------------------------------------------------------------ WGSL render
+const WGSL_COMMON = /* wgsl */`
+struct Frame {
+    viewProj: mat4x4f,
+    cam: vec4f,         // xyz, time
+    camFwd: vec4f,      // xyz, near
+    camRight: vec4f,    // xyz * tan(half fov x)
+    camUp: vec4f,       // xyz * tan(half fov y)
+    sunDir: vec4f,      // xyz, intensity
+    sunColor: vec4f,    // rgb, exposure
+    skyTop: vec4f,      // rgb, fog density
+    skyHorizon: vec4f,  // rgb, highest terrain point
+    ground: vec4f,      // rgb, ambient strength
+    map: vec4f,         // origin x, origin z, cell, n
+    screen: vec4f,      // width, height, min water depth, render mode
+    water: vec4f,       // deep colour, foam
+    absorb: vec4f,      // absorption per metre, refraction
+    cursor: vec4f,      // x, z, radius, visible
+    misc: vec4f,        // wave layers, detail strength, snow line, sea level
+    layers: array<vec4f, 4>,   // newest display: origin x, z, size, time lerp
+    layersB: array<vec4f, 4>,  // older display: origin x, z, newest slot
+    extra: vec4f,       // flow scale
+}
+struct Particle { p: vec4f, q: vec4f }
+struct Emitter { a: vec4f, b: vec4f }
+
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var terrainTex: texture_2d<f32>;
+@group(0) @binding(2) var surfTex: texture_2d<f32>;
+@group(0) @binding(3) var flowTex: texture_2d<f32>;
+@group(0) @binding(4) var linSamp: sampler;
+@group(0) @binding(5) var disp0: texture_2d_array<f32>;
+@group(0) @binding(6) var disp1: texture_2d_array<f32>;
+@group(0) @binding(7) var disp2: texture_2d_array<f32>;
+@group(0) @binding(8) var disp3: texture_2d_array<f32>;
+@group(0) @binding(9) var<storage, read> particles: array<Particle>;
+@group(0) @binding(10) var<storage, read> emitters: array<Emitter>;
+
+fn nCells() -> i32 { return i32(F.map.w); }
+fn cellOf(xz: vec2f) -> vec2f { return (xz - F.map.xy) / F.map.z - 0.5; }
+fn simUV(xz: vec2f) -> vec2f { return (xz - F.map.xy) / (F.map.z * F.map.w); }
+fn loadH(p: vec2i) -> f32 { return textureLoad(terrainTex, clamp(p, vec2i(0), vec2i(nCells() - 1)), 0).x; }
+fn loadSurf(p: vec2i) -> vec2f { return textureLoad(surfTex, clamp(p, vec2i(0), vec2i(nCells() - 1)), 0).xy; }
+fn terrainAt(xz: vec2f) -> f32 {
+    let c = cellOf(xz);
+    let i = vec2i(floor(c));
+    let f = c - floor(c);
+    return mix(mix(loadH(i), loadH(i + vec2i(1, 0)), f.x), mix(loadH(i + vec2i(0, 1)), loadH(i + vec2i(1, 1)), f.x), f.y);
+}
+fn wetAt(xz: vec2f) -> f32 {
+    let c = cellOf(xz);
+    let i = vec2i(floor(c));
+    let f = c - floor(c);
+    return mix(mix(loadSurf(i).y, loadSurf(i + vec2i(1, 0)).y, f.x), mix(loadSurf(i + vec2i(0, 1)).y, loadSurf(i + vec2i(1, 1)).y, f.x), f.y);
+}
+fn flowAt(xz: vec2f) -> vec4f { return textureSampleLevel(flowTex, linSamp, simUV(xz), 0.0); }
+
+fn hash21(p: vec2f) -> f32 {
+    var q = fract(p * vec2f(123.34, 456.21));
+    q += dot(q, q + 45.32);
+    return fract(q.x * q.y);
+}
+// value noise with its analytic gradient: (value, d/dx, d/dy)
+fn noised(p: vec2f) -> vec3f {
+    let i = floor(p);
+    let f = p - i;
+    let u = f * f * (3.0 - 2.0 * f);
+    let du = 6.0 * f * (1.0 - f);
+    let a = hash21(i);
+    let b = hash21(i + vec2f(1.0, 0.0));
+    let c = hash21(i + vec2f(0.0, 1.0));
+    let d = hash21(i + vec2f(1.0, 1.0));
+    let k = a - b - c + d;
+    return vec3f(a + (b - a) * u.x + (c - a) * u.y + k * u.x * u.y, du * (vec2f(b - a, c - a) + k * u.yx));
+}
+
+fn skyColor(d: vec3f) -> vec3f {
+    var c = mix(F.skyHorizon.rgb, F.skyTop.rgb, pow(clamp(d.y, 0.0, 1.0), 0.5));
+    c = mix(c, F.skyHorizon.rgb * 0.7 + F.ground.rgb * 0.3, smoothstep(0.0, -0.25, d.y));
+    let s = max(dot(d, F.sunDir.xyz), 0.0);
+    c += F.sunColor.rgb * (pow(s, 6.0) * 0.12 + pow(s, 90.0) * 0.4) * min(F.sunDir.w, 1.5);
+    return c;
+}
+fn ambient(n: vec3f) -> vec3f { return mix(F.ground.rgb, F.skyTop.rgb * 1.1, n.y * 0.5 + 0.5) * F.ground.w; }
+fn applyFog(c: vec3f, p: vec3f) -> vec3f {
+    let d = p - F.cam.xyz;
+    let dist = length(d);
+    let dir = d / max(dist, 1e-3);
+    let f = 1.0 - exp(-dist * F.skyTop.w);
+    let fc = F.skyHorizon.rgb + F.sunColor.rgb * pow(max(dot(dir, F.sunDir.xyz), 0.0), 8.0) * 0.25;
+    return mix(c, fc, f);
+}
+fn tonemap(c: vec3f) -> vec3f {
+    let x = max(c * F.sunColor.w, vec3f(0.0));
+    let a = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    return pow(clamp(a, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));
+}
+// soft sun shadow marched through the heightfield
+fn sunShadow(pos: vec3f) -> f32 {
+    let d = F.sunDir.xyz;
+    if (d.y < 0.005) { return 0.0; }
+    var t = F.map.z;
+    var res = 1.0;
+    for (var i = 0; i < 40; i++) {
+        let q = pos + d * t;
+        if (q.y > F.skyHorizon.w) { break; }
+        res = min(res, (q.y - terrainAt(q.xz)) / (t * 0.06));
+        if (res < 0.0) { break; }
+        t = t * 1.13 + F.map.z * 0.5;
+    }
+    return smoothstep(0.0, 1.0, clamp(res, 0.0, 1.0));
+}
+fn heat(x: f32) -> vec3f {
+    let t = clamp(x, 0.0, 1.0);
+    return clamp(vec3f(1.5 - abs(4.0 * t - 3.0), 1.5 - abs(4.0 * t - 2.0), 1.5 - abs(4.0 * t - 1.0)), vec3f(0.0), vec3f(1.0));
+}
+fn hue(a: f32) -> vec3f { return clamp(abs(fract(a + vec3f(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3f(0.0), vec3f(1.0)); }
+fn cursorRing(xz: vec2f) -> f32 {
+    if (F.cursor.w < 0.5) { return 0.0; }
+    let d = abs(length(xz - F.cursor.xy) - F.cursor.z);
+    return 1.0 - smoothstep(0.0, 1.2 + F.cursor.z * 0.02, d);
+}
+fn fullscreen(vi: u32) -> vec4f {
+    let uv = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+fn viewRay(ndc: vec2f) -> vec3f { return normalize(F.camFwd.xyz + ndc.x * F.camRight.xyz + ndc.y * F.camUp.xyz); }
+`;
+
+// pass A: sky and terrain into the HDR scene target
+const WGSL_SCENE = /* wgsl */`
+struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f }
+@vertex fn vsSky(@builtin(vertex_index) vi: u32) -> SkyOut {
+    let p = fullscreen(vi);
+    return SkyOut(p, p.xy);
+}
+@fragment fn fsSky(in: SkyOut) -> @location(0) vec4f {
+    let d = viewRay(in.ndc);
+    var c = skyColor(d);
+    c += F.sunColor.rgb * F.sunDir.w * 12.0 * smoothstep(0.99955, 0.9998, dot(d, F.sunDir.xyz));
+    return vec4f(c, 1.0);
+}
+
+struct TOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @location(1) normal: vec3f }
+@vertex fn vsTerrain(@builtin(vertex_index) vi: u32) -> TOut {
+    let n = nCells();
+    let w = n + 2;              // one skirt vertex ring around the map
+    let i = i32(vi) % w - 1;
+    let j = i32(vi) / w - 1;
+    let c = clamp(vec2i(i, j), vec2i(0), vec2i(n - 1));
+    let skirt = i != c.x || j != c.y;
+    var h = loadH(c);
+    let gx = (loadH(c + vec2i(1, 0)) - loadH(c - vec2i(1, 0))) / (2.0 * F.map.z);
+    let gz = (loadH(c + vec2i(0, 1)) - loadH(c - vec2i(0, 1))) / (2.0 * F.map.z);
+    var nrm = normalize(vec3f(-gx, 1.0, -gz));
+    if (skirt) { h = min(h, F.misc.w) - 40.0; }
+    let world = vec3f(F.map.x + (f32(c.x) + 0.5) * F.map.z, h, F.map.y + (f32(c.y) + 0.5) * F.map.z);
+    return TOut(F.viewProj * vec4f(world, 1.0), world, nrm);
+}
+@fragment fn fsTerrain(in: TOut) -> @location(0) vec4f {
+    let p = in.world;
+    let n = normalize(in.normal);
+    let nz = noised(p.xz * 0.045).x * 0.55 + noised(p.xz * 0.21).x * 0.3 + noised(p.xz * 1.3).x * 0.15;
+    let slope = 1.0 - n.y;
+    let grass = mix(vec3f(0.085, 0.14, 0.045), vec3f(0.22, 0.24, 0.10), nz);
+    let rock = mix(vec3f(0.22, 0.20, 0.18), vec3f(0.40, 0.37, 0.33), nz);
+    let sand = vec3f(0.50, 0.44, 0.32) * (0.85 + 0.3 * nz);
+    let snow = vec3f(0.86, 0.89, 0.93);
+    var alb = grass;
+    alb = mix(alb, sand, 1.0 - smoothstep(F.misc.w + 1.0, F.misc.w + 5.0, p.y + nz * 2.0));
+    alb = mix(alb, rock, smoothstep(0.26, 0.42, slope + nz * 0.12));
+    alb = mix(alb, snow, smoothstep(F.misc.z, F.misc.z + 30.0, p.y + nz * 40.0) * (1.0 - smoothstep(0.35, 0.6, slope)));
+    let fl = flowAt(p.xz);
+    let bed = smoothstep(0.0, 0.4, fl.x);
+    alb = mix(alb, mix(sand, rock, 0.35 + 0.3 * nz) * 0.85, bed * 0.8);
+    alb *= mix(1.0, 0.5, clamp(wetAt(p.xz), 0.0, 1.0));
+
+    let sh = sunShadow(p + n * 0.4);
+    let ndl = max(dot(n, F.sunDir.xyz), 0.0);
+    let sun = F.sunColor.rgb * F.sunDir.w;
+    var col = alb * (sun * ndl * sh + ambient(n));
+    if (fl.x > 0.02) {
+        let t = F.cam.w;
+        let v = noised(p.xz * 0.32 + vec2f(t * 0.35, t * 0.2)).x + noised(p.xz * 0.51 - vec2f(t * 0.25, -t * 0.3)).x;
+        let caustic = pow(1.0 - abs(v - 1.0), 8.0) * exp(-fl.x * 0.35) * smoothstep(0.02, 0.25, fl.x);
+        col += alb * sun * caustic * sh * ndl * 1.4;
+    }
+    if (F.screen.w > 0.5) {
+        col = vec3f(dot(alb, vec3f(0.3, 0.55, 0.15))) * (ndl * sh * 0.7 + 0.3) * 1.2;
+    }
+    col = mix(col, vec3f(1.0, 0.8, 0.3) * 2.0, cursorRing(p.xz));
+    return vec4f(applyFog(col, p), 1.0);
+}
+`;
+
+// pass B: tonemapped scene, then water (refracting the scene) and debris on top
+const WGSL_SURFACE = /* wgsl */`
+@group(1) @binding(0) var sceneTex: texture_2d<f32>;
+@group(1) @binding(1) var sceneDepth: texture_depth_2d;
+
+@vertex fn vsComposite(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f { return fullscreen(vi); }
+@fragment fn fsComposite(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    return vec4f(tonemap(textureLoad(sceneTex, vec2i(pos.xy), 0).rgb), 1.0);
+}
+
+fn dispSample(i: i32, uv: vec2f, slot: i32) -> vec4f {
+    if (i == 0) { return textureSampleLevel(disp0, linSamp, uv, slot, 0.0); }
+    if (i == 1) { return textureSampleLevel(disp1, linSamp, uv, slot, 0.0); }
+    if (i == 2) { return textureSampleLevel(disp2, linSamp, uv, slot, 0.0); }
+    return textureSampleLevel(disp3, linSamp, uv, slot, 0.0);
+}
+// sum of the wave cascades: (height, d/dx, d/dz, foam); each layer fades out towards its border
+fn waves(xz: vec2f) -> vec4f {
+    var acc = vec4f(0.0);
+    for (var i = 0; i < 4; i++) {
+        if (f32(i) >= F.misc.x) { break; }
+        let L = F.layers[i];
+        let B = F.layersB[i];
+        let uvC = (xz - L.xy) / L.z;
+        let e = min(min(uvC.x, 1.0 - uvC.x), min(uvC.y, 1.0 - uvC.y));
+        let w = smoothstep(0.0, 0.12, e);
+        if (w <= 0.0) { continue; }
+        let slot = i32(B.z);
+        let a = dispSample(i, uvC, slot);
+        let b = dispSample(i, (xz - B.xy) / L.z, 1 - slot);
+        acc += mix(b, a, L.w) * w;
+    }
+    return acc;
+}
+fn ripples(p: vec2f) -> vec2f {
+    return noised(p * 0.16).yz * 0.16 * 0.45 + noised(p * 0.37 + 11.0).yz * 0.37 * 0.2 + noised(p * 0.83 + 23.0).yz * 0.83 * 0.08;
+}
+// two-phase flow map: detail ripples slide with the current and cross-fade every half period
+fn flowDetail(xz: vec2f, vel: vec2f, t: f32) -> vec2f {
+    let ph = fract(vec2f(t * 0.25, t * 0.25 + 0.5));
+    let w0 = 1.0 - abs(ph.x * 2.0 - 1.0);
+    let g0 = ripples(xz - vel * ph.x * 4.0);
+    let g1 = ripples(xz - vel * ph.y * 4.0 + vec2f(37.1, 11.7));
+    let breeze = ripples(xz * 0.6 + vec2f(t * 0.9, t * 0.4) + 71.0) * 0.35;
+    return (g0 * w0 + g1 * (1.0 - w0)) * (0.35 + min(length(vel), 4.0) * 0.4) + breeze;
+}
+fn foamPattern(xz: vec2f, vel: vec2f, t: f32) -> f32 {
+    let ph = fract(vec2f(t * 0.2, t * 0.2 + 0.5));
+    let w0 = 1.0 - abs(ph.x * 2.0 - 1.0);
+    let a = noised((xz - vel * ph.x * 5.0) * 0.55).x * 0.6 + noised((xz - vel * ph.x * 5.0) * 1.7).x * 0.4;
+    let b = noised((xz - vel * ph.y * 5.0) * 0.55 + 5.3).x * 0.6 + noised((xz - vel * ph.y * 5.0) * 1.7 + 2.1).x * 0.4;
+    return mix(b, a, w0);
+}
+
+struct WOut {
+    @builtin(position) pos: vec4f,
+    @location(0) world: vec3f,
+    @location(1) grad: vec2f,
+    @location(2) valid: f32,
+}
+fn surfOr(p: vec2i, fallback: f32) -> f32 {
+    let s = loadSurf(p).x;
+    return select(s, fallback, s < -1e4);
+}
+@vertex fn vsWater(@builtin(vertex_index) vi: u32) -> WOut {
+    let n = nCells();
+    let c = vec2i(i32(vi) % n, i32(vi) / n);
+    let s = loadSurf(c).x;
+    var y = s;
+    var valid = 1.0;
+    if (s < -1e4) {
+        // dry: just under the terrain next to water (a smooth shoreline), far under it elsewhere (early-z rejects it)
+        var near = false;
+        for (var k = 0; k < 9; k++) { near = near || loadSurf(c + vec2i(k % 3 - 1, k / 3 - 1)).x > -1e4; }
+        y = loadH(c) - select(50.0, 0.4, near);
+        valid = 0.0;
+    }
+    let gx = (surfOr(c + vec2i(1, 0), y) - surfOr(c - vec2i(1, 0), y)) / (2.0 * F.map.z);
+    let gz = (surfOr(c + vec2i(0, 1), y) - surfOr(c - vec2i(0, 1), y)) / (2.0 * F.map.z);
+    let world = vec3f(F.map.x + (f32(c.x) + 0.5) * F.map.z, y, F.map.y + (f32(c.y) + 0.5) * F.map.z);
+    return WOut(F.viewProj * vec4f(world, 1.0), world, vec2f(gx, gz) * valid, valid);
+}
+@fragment fn fsWater(in: WOut) -> @location(0) vec4f {
+    let p = in.world;
+    let toCam = F.cam.xyz - p;
+    let dist = length(toCam);
+    let v = toCam / dist;
+    let fl = flowAt(p.xz);
+    let vel = fl.yz * F.extra.x;
+    let wv = waves(p.xz);
+    let lod = 1.0 / (1.0 + dist / 300.0);
+    let g = clamp(in.grad, vec2f(-0.6), vec2f(0.6)) + wv.yz * lod + flowDetail(p.xz, vel, F.cam.w) * (F.misc.y * lod);
+    let n = normalize(vec3f(-g.x, 1.0, -g.y));
+
+    // screen-space refraction against the terrain depth
+    let px = in.pos.xy;
+    let suv = px / F.screen.xy;
+    let near = F.camFwd.w;
+    let fragZ = near / in.pos.z;
+    let sceneZ0 = near / max(textureLoad(sceneDepth, vec2i(px), 0), 1e-7);
+    let thick0 = max(sceneZ0 - fragZ, 0.0);
+    var ruv = suv + n.xz * F.absorb.w * min(thick0, 6.0) / (1.0 + fragZ * 0.01);
+    ruv = clamp(ruv, vec2f(0.0), vec2f(0.999));
+    var sceneZ = near / max(textureLoad(sceneDepth, vec2i(ruv * F.screen.xy), 0), 1e-7);
+    if (sceneZ < fragZ) { ruv = suv; sceneZ = sceneZ0; }
+    let refr = textureSampleLevel(sceneTex, linSamp, ruv, 0.0).rgb;
+    let raw = textureSampleLevel(sceneTex, linSamp, suv, 0.0).rgb;
+    let rayLen = max(sceneZ - fragZ, 0.0) * dist / fragZ;
+    let T = exp(-F.absorb.rgb * rayLen);
+
+    let sh = sunShadow(p + vec3f(0.0, 0.3, 0.0));
+    let sun = F.sunColor.rgb * F.sunDir.w;
+    let light = sun * (max(F.sunDir.y, 0.0) * sh * 0.8 + 0.1) + F.skyTop.rgb * F.ground.w;
+    let under = refr * T + F.water.rgb * light * (1.0 - T);
+    let r = reflect(-v, n);
+    let refl = skyColor(normalize(vec3f(r.x, abs(r.y), r.z)));
+    let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+    var col = mix(under, refl, fres);
+    col += sun * pow(max(dot(r, F.sunDir.xyz), 0.0), 500.0) * 10.0 * sh;
+
+    let speed = length(fl.yz);
+    let shore = (1.0 - smoothstep(0.0, 0.5, rayLen)) * smoothstep(0.3, 1.5, speed);
+    let foamAmt = clamp(wv.w + max(fl.w - 0.75, 0.0) * 1.6 + shore * 0.3, 0.0, 1.0);
+    let foam = clamp(foamAmt * 1.4, 0.0, 1.0) * clamp((foamPattern(p.xz, vel, F.cam.w) + 0.3 - (1.0 - foamAmt) * 0.5) * 1.7, 0.0, 1.0) * F.water.w;
+    col = mix(col, vec3f(0.88, 0.92, 0.94) * (light + sun * 0.1), foam);
+    col = applyFog(col, p);
+    col = mix(raw, col, smoothstep(0.0, 0.25, thick0 * dist / fragZ));
+
+    let mode = i32(F.screen.w + 0.5);
+    if (mode == 1) { col = heat(sqrt(fl.x / 12.0)) * 0.9 + 0.1 * n.y; }
+    if (mode == 2) { col = hue(atan2(fl.z, fl.y) / 6.2831853 + 0.5) * clamp(speed / 3.0, 0.08, 1.0); }
+    if (mode == 3) { col = vec3f(foamAmt, fl.w * 0.6, 0.15 + 0.2 * fl.w); }
+    if (mode == 4) { col = vec3f(0.5 + wv.x * 3.0, 0.5 + wv.x * 3.0, 0.6) * (0.5 + 0.5 * n.y) + vec3f(wv.w * 0.5, 0.0, 0.0); }
+    col = mix(col, vec3f(1.0, 0.8, 0.3) * 2.0, cursorRing(p.xz));
+    if (mode > 0) { return vec4f(pow(clamp(col, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)), 1.0); }
+    return vec4f(tonemap(col), 1.0);
+}
+
+struct DOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @location(1) n: vec3f, @location(2) col: vec3f }
+@vertex fn vsDebris(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> DOut {
+    let pt = particles[ii];
+    let e = emitters[u32(pt.q.z)];
+    let face = vi / 6u;
+    let k = vi % 6u;
+    let uv = array<vec2f, 6>(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0))[k] - 0.5;
+    let axis = face / 2u;
+    let sgn = select(1.0, -1.0, (face & 1u) == 1u);
+    var N = vec3f(0.0); var T = vec3f(0.0); var Bt = vec3f(0.0);
+    if (axis == 0u) { N = vec3f(sgn, 0.0, 0.0); T = select(vec3f(0.0, 0.0, 1.0), vec3f(0.0, 1.0, 0.0), sgn > 0.0); }
+    if (axis == 1u) { N = vec3f(0.0, sgn, 0.0); T = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), sgn > 0.0); }
+    if (axis == 2u) { N = vec3f(0.0, 0.0, sgn); T = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), sgn > 0.0); }
+    Bt = cross(N, T);
+    let local = N * 0.5 + T * uv.x + Bt * uv.y;
+    let s = e.b.w * (0.6 + 0.8 * pt.q.w);
+    let scaled = local * vec3f(s, s * 0.28, s * 0.3);
+    let ch = cos(pt.q.x);
+    let sh = sin(pt.q.x);
+    let rot = vec3f(ch * scaled.x - sh * scaled.z, scaled.y, sh * scaled.x + ch * scaled.z);
+    let rn = vec3f(ch * N.x - sh * N.z, N.y, sh * N.x + ch * N.z);
+    let world = pt.p.xyz + rot;
+    return DOut(F.viewProj * vec4f(world, 1.0), world, rn, e.b.rgb * (0.75 + 0.5 * fract(pt.q.w * 7.0)));
+}
+@fragment fn fsDebris(in: DOut) -> @location(0) vec4f {
+    let n = normalize(in.n);
+    let c = in.col * (F.sunColor.rgb * F.sunDir.w * max(dot(n, F.sunDir.xyz), 0.0) + ambient(n));
+    return vec4f(tonemap(applyFog(c, in.world)), 1.0);
+}
+`;
+
+// =====================================================================================================
+// GPU helpers
+// =====================================================================================================
+const TU = () => GPUTextureUsage;
+const BU = () => GPUBufferUsage;
+
+function makeLayout(device, visibility, kinds) {
+    return device.createBindGroupLayout({
+        entries: kinds.map((k, binding) => {
+            const [kind, arg] = k.split(':'), e = { binding, visibility };
+            if (kind === 'uniform') e.buffer = { type: 'uniform' };
+            else if (kind === 'storage') e.buffer = { type: 'storage' };
+            else if (kind === 'read') e.buffer = { type: 'read-only-storage' };
+            else if (kind === 'tex') e.texture = { sampleType: arg || 'float', viewDimension: '2d' };
+            else if (kind === 'array') e.texture = { sampleType: 'float', viewDimension: '2d-array' };
+            else if (kind === 'sampler') e.sampler = { type: 'filtering' };
+            else if (kind === 'write') e.storageTexture = { access: 'write-only', format: arg, viewDimension: '2d' };
+            else throw new Error(`layout kind ${k}`);
+            return e;
+        }),
+    });
+}
+
+function makeGroup(device, layout, resources, label) {
+    return device.createBindGroup({
+        label, layout,
+        entries: resources.map((r, binding) => ({ binding, resource: r instanceof GPUBuffer ? { buffer: r } : r })),
+    });
+}
+
+function makeTex(device, w, h, format, usage, layers = 1) {
+    return device.createTexture({ size: [w, h, layers], format, usage });
+}
+
+function makeBuffer(device, size, usage, data) {
+    const b = device.createBuffer({ size: Math.max(16, Math.ceil(size / 4) * 4), usage, mappedAtCreation: !!data });
+    if (data) { new data.constructor(b.getMappedRange()).set(data); b.unmap(); }
+    return b;
+}
+
+function gridIndices(w) {
+    const idx = new Uint32Array((w - 1) * (w - 1) * 6);
+    let o = 0;
+    for (let j = 0; j < w - 1; j++) for (let i = 0; i < w - 1; i++) {
+        const a = j * w + i, b = a + 1, c = a + w, d = c + 1;
+        idx[o++] = a; idx[o++] = c; idx[o++] = b;
+        idx[o++] = b; idx[o++] = c; idx[o++] = d;
+    }
+    return idx;
+}
+
+// =====================================================================================================
+// Entities
+// =====================================================================================================
+// Built from scenario definitions ({ type, id, label, ... }) in order. Hooks, all optional:
+//   stamp(field)   shape the terrain (build time)
+//   fill(water)    initial water depth per cell (build time)
+//   spawn()        register with the world (debris emitters, sea level, ...)
+//   sources(out)   per frame: push water sources / sinks, or add to out.rain
+//   update(dt, t)  per frame (dams animate their breach)
+class Entity {
+    constructor(def, world) {
+        this.def = def;
+        this.world = world;
+        this.id = def.id || null;
+        this.label = def.label || '';
+    }
+
+    // label anchor in world space
+    get anchor() {
+        const p = this.def.labelPos || this.def.pos;
+        if (!p) return null;
+        return [p[0], this.world.field.sample(p[0], p[1]) + (this.def.labelHeight ?? 16), p[1]];
+    }
+
+    stamp(field) {}
+    fill(water) {}
+    spawn() {}
+    sources(out) {}
+    update(dt, t) {}
+}
+
+// --- terrain features
+
+// global slope along `dir` (downhill): the far side is `drop` metres lower than the near side
+class Tilt extends Entity {
+    stamp(f) {
+        const [dx, dz] = this.def.dir || [0, 1], l = Math.hypot(dx, dz) || 1, drop = this.def.drop || 0;
+        f.eachAll((idx, x, z) => { f.h[idx] -= drop * (x * dx + z * dz) / l / f.size; });
+    }
+}
+
+class Hills extends Entity {
+    stamp(f) {
+        const d = this.def, s = d.scale || 400, amp = d.amplitude || 20, opt = { octaves: d.octaves || 5, seed: d.seed || 1, ridged: !!d.ridged };
+        f.eachAll((idx, x, z) => { f.h[idx] += amp * fbm(x / s, z / s, opt); });
+    }
+}
+
+class Mountain extends Entity {
+    get anchor() { const a = super.anchor; return a && [a[0], a[1] + 10, a[2]]; }
+    stamp(f) {
+        const d = this.def, [cx, cz] = d.pos, r = d.radius, hgt = d.height, rough = d.roughness ?? 0.4, seed = d.seed || 3;
+        f.each(cx - r, cz - r, cx + r, cz + r, (idx, x, z) => {
+            const t = Math.hypot(x - cx, z - cz) / r;
+            if (t >= 1) return;
+            const shape = Math.pow(1 - smoothstep(0, 1, t), 1.6);
+            const ridge = fbm(x / (r * 0.35), z / (r * 0.35), { octaves: 5, seed, ridged: true });
+            f.h[idx] += hgt * shape * (1 - rough + rough * 1.6 * ridge);
+        });
+    }
+}
+
+// carves a river valley along a polyline: channel bed from levels[0] to levels[1], smooth banks
+class Valley extends Entity {
+    get anchor() { const p = this.def.path[0]; return [p[0], this.world.field.sample(p[0], p[1]) + 16, p[1]]; }
+    stamp(f) {
+        const d = this.def, pts = d.path, lens = polylineLengths(pts), total = lens[lens.length - 1] || 1;
+        const halfW = (d.width || 20) / 2, bank = d.bank ?? d.width * 3, ch = d.channel ?? 2, pad = halfW + bank;
+        const [a, b] = d.levels, wig = d.wiggle || 0, ws = d.wiggleScale || 140, seed = d.seed || 11;
+        const xs = pts.map(p => p[0]), zs = pts.map(p => p[1]);
+        f.each(Math.min(...xs) - pad - wig, Math.min(...zs) - pad - wig, Math.max(...xs) + pad + wig, Math.max(...zs) + pad + wig, (idx, x, z) => {
+            const px = x + wig * fbm(x / ws, z / ws, { octaves: 3, seed }), pz = z + wig * fbm(x / ws, z / ws, { octaves: 3, seed: seed + 7 });
+            const { dist, s } = polylineNearest(pts, lens, px, pz);
+            if (dist >= pad) return;
+            const bottom = lerp(a, b, s / total);
+            const target = dist < halfW ? bottom - ch * (1 - (dist / halfW) ** 2) : bottom;
+            const k = Math.sqrt(smoothstep(halfW, pad, dist)), h = f.h[idx];
+            f.h[idx] = Math.min(h, target + (h - target) * k);
+        });
+    }
+}
+
+// lowers a round bowl towards `floor`; `rim` first raises a flat ring (up to radius + rimWidth) so the lake holds
+class Basin extends Entity {
+    stamp(f) {
+        const d = this.def, [cx, cz] = d.pos, r = d.radius, fl = d.floor, seed = d.seed || 5, rw = d.rimWidth || 0, reach = r * 1.2 + rw;
+        f.each(cx - reach, cz - reach, cx + reach, cz + reach, (idx, x, z) => {
+            const dist = Math.hypot(x - cx, z - cz), t = dist / r + 0.15 * fbm(x / (r * 0.5), z / (r * 0.5), { octaves: 3, seed });
+            if (d.rim !== undefined && dist < r + rw) f.h[idx] = Math.max(f.h[idx], lerp(d.rim, f.h[idx], smoothstep(r + rw * 0.5, r + rw, dist)));
+            if (t >= 1) return;
+            const h = f.h[idx];
+            f.h[idx] = Math.min(h, fl + (h - fl) * smoothstep(0, 1, t));
+        });
+    }
+}
+
+// lowers everything past `at` (along `dir`) to the sea floor
+class Coast extends Entity {
+    stamp(f) {
+        const d = this.def, [dx, dz] = d.dir || [0, 1], l = Math.hypot(dx, dz) || 1, w = d.width || 200, seed = d.seed || 9;
+        f.eachAll((idx, x, z) => {
+            const s = (x * dx + z * dz) / l + w * 0.5 * fbm(x / 300, z / 300, { octaves: 3, seed });
+            const k = smoothstep(d.at - w, d.at + w, s);
+            if (k > 0) f.h[idx] = lerp(f.h[idx], d.floor, k);
+        });
+    }
+}
+
+// earth dam with a spillway notch; X breaches it (a gap erodes down to the original valley) and restores it
+class Dam extends Entity {
+    get anchor() { const [a, b] = [this.def.from, this.def.to]; return [(a[0] + b[0]) / 2, this.def.crest + 14, (a[1] + b[1]) / 2]; }
+    stamp(f) {
+        const d = this.def, [ax, az] = d.from, [bx, bz] = d.to, len = Math.hypot(bx - ax, bz - az);
+        const halfTop = (d.top || 8) / 2, side = d.side || 1.6, crest = d.crest;
+        const spill = d.spillway || { width: 0, depth: 0 }, gap = d.gap || { at: 0.5, width: 40 };
+        const reach = halfTop + (crest - f.min + 10) * side;
+        const cells = [];
+        const rect = f.each(Math.min(ax, bx) - reach, Math.min(az, bz) - reach, Math.max(ax, bx) + reach, Math.max(az, bz) + reach, (idx, x, z) => {
+            const { dist, s } = polylineNearest([d.from, d.to], [0, len], x, z);
+            const along = Math.abs(s - len / 2);
+            const top = crest - spill.depth * (1 - smoothstep(spill.width / 2, spill.width / 2 + 4, along));
+            const wall = top - Math.max(0, dist - halfTop) / side;
+            if (wall <= f.h[idx] - 20) return;
+            const gapMask = 1 - smoothstep(gap.width / 2, gap.width / 2 + 12, Math.abs(s - gap.at * len));
+            cells.push([idx, f.h[idx], wall, gapMask]);
+        });
+        this.rect = rect;
+        this.cells = cells;
+        this.breach = 0;
+        this.target = 0;
+        this.apply(f);
+    }
+
+    apply(f) {
+        const b = Math.sqrt(this.breach);
+        for (const [idx, base, wall, gapMask] of this.cells) f.h[idx] = Math.max(base, wall - b * gapMask * (wall - base + 6));
+        f.touch(this.rect);
+    }
+
+    toggle() { this.target = this.target ? 0 : 1; return this.target; }
+
+    update(dt) {
+        if (this.breach === this.target) return;
+        const step = dt / (this.def.breachTime || 10);
+        this.breach = this.target > this.breach ? Math.min(this.target, this.breach + step) : Math.max(this.target, this.breach - step * 3);
+        this.apply(this.world.field);
+    }
+}
+
+// --- water
+
+// fills every cell below `level` connected to the map edge, and holds the edge at that level
+class Sea extends Entity {
+    fill(water) {
+        const f = this.world.field, n = f.n, seeds = [];
+        for (let k = 0; k < n; k++) seeds.push(k, (n - 1) * n + k, k * n, k * n + n - 1);
+        floodFill(f, water, seeds, this.def.level);
+    }
+    spawn() { this.world.seaLevel = this.def.level; }
+}
+
+class Lake extends Entity {
+    get anchor() { const [x, z] = this.def.pos; return [x, this.def.level + 12, z]; }
+    fill(water) {
+        const f = this.world.field, n = f.n, [x, z] = this.def.pos;
+        const i = clamp(Math.round(f.ci(x)), 0, n - 1), j = clamp(Math.round(f.ci(z)), 0, n - 1);
+        this.cells = floodFill(f, water, [j * n + i], this.def.level);
+    }
+}
+
+class Spring extends Entity {
+    sources(out) {
+        const d = this.def, boost = this.world.boost ? (d.boost ?? 8) : 1;
+        out.list.push({ x: d.pos[0], z: d.pos[1], radius: d.radius || 12, rate: (d.rate || 1) * boost });
+    }
+}
+
+class Drain extends Entity {
+    sources(out) {
+        const d = this.def;
+        out.list.push({ x: d.pos[0], z: d.pos[1], radius: d.radius || 12, rate: -(d.rate || 1), flat: true });
+    }
+}
+
+// mm/h everywhere, or over a disc; R toggles all rain
+class Rain extends Entity {
+    spawn() { if (this.def.enabled) this.world.rainOn = true; }
+    sources(out) {
+        if (!this.world.rainOn) return;
+        const d = this.def, ms = (d.rate || 10) / 3.6e6;
+        if (d.pos) out.list.push({ x: d.pos[0], z: d.pos[1], radius: d.radius || 100, rate: ms * Math.PI * (d.radius || 100) ** 2, flat: true });
+        else out.rain += ms;
+    }
+}
+
+// floating logs that drift with the current, respawning upstream
+class Debris extends Entity {
+    spawn() {
+        const d = this.def;
+        this.world.emitters.push({ x: d.pos[0], z: d.pos[1], radius: d.radius || 20, life: d.life || 600, color: d.color || [0.4, 0.28, 0.16], size: d.size || 2, count: d.count || 200 });
+    }
+}
+
+const ENTITY_TYPES = {
+    tilt: Tilt,
+    hills: Hills,
+    mountain: Mountain,
+    valley: Valley,
+    basin: Basin,
+    coast: Coast,
+    dam: Dam,
+    sea: Sea,
+    lake: Lake,
+    spring: Spring,
+    drain: Drain,
+    rain: Rain,
+    debris: Debris,
+};
+
+// ------------------------------------------------------------------------------------------------- world
+class World {
+    constructor(scenario) {
+        this.scenario = scenario;
+        const t = { size: 2048, resolution: 512, base: 0, ...(scenario.terrain || {}) };
+        this.field = new Heightfield(t.size, t.resolution, t.base);
+        this.snowLine = t.snowLine ?? 1e4;
+        this.entities = [];
+        this.byId = new Map();
+        this.emitters = [];
+        this.seaLevel = null;
+        this.rainOn = false;
+        this.boost = false;
+        for (const def of scenario.entities || []) {
+            const Type = ENTITY_TYPES[def.type];
+            if (!Type) throw new Error(`unknown entity type "${def.type}"`);
+            const e = new Type(def, this);
+            this.entities.push(e);
+            if (e.id) this.byId.set(e.id, e);
+        }
+        for (const e of this.entities) { e.stamp(this.field); this.field.updateRange(); }
+        this.water = new Float32Array(this.field.n * this.field.n);
+        for (const e of this.entities) e.fill(this.water);
+        for (const e of this.entities) e.spawn();
+        this.field.dirty = null;
+    }
+
+    get(id) { return this.byId.get(id); }
+
+    gather() {
+        const out = { list: [], rain: 0 };
+        for (const e of this.entities) e.sources(out);
+        return out;
+    }
+
+    update(dt, t) { for (const e of this.entities) e.update(dt, t); }
+}
+
+// =====================================================================================================
+// Simulation (GPU)
+// =====================================================================================================
+class FlowSim {
+    constructor(device, world) {
+        this.device = device;
+        this.world = world;
+        const f = world.field, n = f.n, U = TU(), B = BU();
+        this.n = n;
+        this.cfg = { ...SIM_DEFAULTS, ...(world.scenario.sim || {}) };
+        this.edgeMode = world.seaLevel !== null ? 2 : this.cfg.edges === 'closed' ? 0 : 1;
+        this.terrain = makeTex(device, n, n, 'r32float', U.TEXTURE_BINDING | U.COPY_DST);
+        this.state = [0, 1].map(() => makeTex(device, n, n, 'rgba32float', U.TEXTURE_BINDING | U.STORAGE_BINDING | U.COPY_DST | U.COPY_SRC));
+        this.surf = makeTex(device, n, n, 'rg32float', U.TEXTURE_BINDING | U.STORAGE_BINDING);
+        this.flow = makeTex(device, n, n, 'rgba16float', U.TEXTURE_BINDING | U.STORAGE_BINDING);
+        this.params = new ArrayBuffer(96);
+        this.paramBuf = makeBuffer(device, 96, B.UNIFORM | B.COPY_DST);
+        this.sourceData = new Float32Array(MAX_SOURCES * SOURCE_FLOATS);
+        this.sourceBuf = makeBuffer(device, this.sourceData.byteLength, B.STORAGE | B.COPY_DST);
+        this.statsBuf = makeBuffer(device, 16, B.STORAGE | B.COPY_SRC | B.COPY_DST);
+        this.readBuf = makeBuffer(device, 16, B.MAP_READ | B.COPY_DST);
+        this.stats = { volume: 0, wet: 0, maxSpeed: 0 };
+        this.statsState = 'idle';
+
+        const layout = makeLayout(device, GPUShaderStage.COMPUTE, ['uniform', 'tex:unfilterable-float', 'tex:unfilterable-float', 'write:rgba32float', 'read', 'write:rg32float', 'write:rgba16float', 'storage']);
+        const module = device.createShaderModule({ label: 'flow', code: WGSL_FLOW });
+        const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+        const pipe = entryPoint => device.createComputePipeline({ label: entryPoint, layout: pl, compute: { module, entryPoint } });
+        this.pSim = pipe('simulate');
+        this.pProp = pipe('propagate');
+        this.pInfo = pipe('info');
+        const grp = (a, b) => makeGroup(device, layout, [this.paramBuf, this.terrain.createView(), this.state[a].createView(), this.state[b].createView(), this.sourceBuf, this.surf.createView(), this.flow.createView(), this.statsBuf]);
+        this.groups = [grp(0, 1), grp(1, 0)];
+        this.uploadTerrain(true);
+        this.reset();
+    }
+
+    get cell() { return this.world.field.cell; }
+    // velocity is in cells per step, so gravity enters as g dt^2 / dx (RiverSim's free `acceleration` can override it)
+    get acceleration() { return this.cfg.acceleration ?? this.cfg.gravity * this.cfg.stepTime ** 2 / this.cell; }
+    get velScale() { return this.cell / this.cfg.stepTime; }
+
+    uploadTerrain(full = false) {
+        const f = this.world.field, n = this.n;
+        const r = full ? { i0: 0, j0: 0, i1: n - 1, j1: n - 1 } : f.dirty;
+        f.dirty = null;
+        if (!r) return;
+        this.device.queue.writeTexture({ texture: this.terrain, origin: [r.i0, r.j0] }, f.h,
+            { offset: (r.j0 * n + r.i0) * 4, bytesPerRow: n * 4, rowsPerImage: n }, [r.i1 - r.i0 + 1, r.j1 - r.j0 + 1]);
+    }
+
+    reset() {
+        const n = this.n, w = this.world.water, data = new Float32Array(n * n * 4);
+        for (let k = 0; k < n * n; k++) { data[k * 4] = w[k]; data[k * 4 + 3] = w[k] > this.cfg.minDepth ? 1 : 0; }
+        this.device.queue.writeTexture({ texture: this.state[0] }, data, { bytesPerRow: n * 16, rowsPerImage: n }, [n, n]);
+        this.warmupLeft = this.cfg.warmup;
+        this.steps = 0;
+    }
+
+    // water sources in m3/s (sim time) -> depth per step at the source centre
+    writeParams(gathered, extra, frame) {
+        const c = this.cfg, cell = this.cell, st = c.stepTime, list = [...gathered.list, ...extra].slice(0, MAX_SOURCES), sd = this.sourceData;
+        list.forEach((s, k) => {
+            const rc = Math.max(1.5, s.radius / cell), area = (s.flat ? Math.PI : 8 * Math.PI / 15) * (rc * cell) ** 2;
+            sd.set([(s.x - this.world.field.origin) / cell - 0.5, (s.z - this.world.field.origin) / cell - 0.5, rc, s.rate * st / area, s.flat ? 1 : 0, 0, 0, 0], k * SOURCE_FLOATS);
+        });
+        if (list.length) this.device.queue.writeBuffer(this.sourceBuf, 0, sd, 0, list.length * SOURCE_FLOATS);
+        const u = new Uint32Array(this.params), f = new Float32Array(this.params);
+        const mmh = x => x / 3.6e6 * st;
+        u[0] = this.n; u[1] = list.length; u[2] = this.edgeMode; u[3] = frame;
+        f.set([cell, st, c.diffusion, this.acceleration, c.linDamping, c.sqrDamping, c.absorption, gathered.rain * st,
+            c.frictionMinDepth, c.frictionMaxDepth, c.frictionAmount, this.world.seaLevel ?? 0,
+            c.minDepth, c.wetDecay, mmh(c.evaporation), this.velScale, c.cfl, c.turbulenceSpeed], 4);
+        this.device.queue.writeBuffer(this.paramBuf, 0, this.params);
+        this.inflow = list.reduce((a, s) => a + Math.max(0, s.rate), 0) + gathered.rain * this.world.field.size ** 2;
+    }
+
+    encode(enc, steps) {
+        const g = Math.ceil(this.n / 8);
+        enc.clearBuffer(this.statsBuf);
+        const pass = enc.beginComputePass({ label: 'flow' });
+        for (let s = 0; s < steps; s++) {
+            pass.setPipeline(this.pSim); pass.setBindGroup(0, this.groups[0]); pass.dispatchWorkgroups(g, g);
+            pass.setPipeline(this.pProp); pass.setBindGroup(0, this.groups[1]); pass.dispatchWorkgroups(g, g);
+        }
+        pass.setPipeline(this.pInfo); pass.setBindGroup(0, this.groups[0]); pass.dispatchWorkgroups(g, g);
+        pass.end();
+        this.steps += steps;
+        if (this.statsState === 'idle') { enc.copyBufferToBuffer(this.statsBuf, 0, this.readBuf, 0, 16); this.statsState = 'copied'; }
+    }
+
+    afterSubmit() {
+        if (this.statsState !== 'copied') return;
+        this.statsState = 'mapping';
+        this.readBuf.mapAsync(GPUMapMode.READ).then(() => {
+            const u = new Uint32Array(this.readBuf.getMappedRange().slice(0));
+            this.readBuf.unmap();
+            this.stats = { volume: u[0] / 10, wet: u[1], maxSpeed: new Float32Array(u.buffer)[2] };
+            this.statsState = 'idle';
+        }).catch(() => { this.statsState = 'idle'; });
+    }
+}
+
+// wave cascades: each layer steps at its own rate so waves travel at `speed` m/s in every layer
+class WaveLayer {
+    constructor(device, shared, flow, cfg, waveCfg, index) {
+        const U = TU(), res = cfg.resolution || 512;
+        this.device = device;
+        this.shared = shared;
+        this.flow = flow;
+        this.index = index;
+        this.res = res;
+        this.size = cfg.size;
+        this.texel = cfg.size / res;
+        this.heightScale = cfg.height ?? 0.1;
+        this.hz = (waveCfg.speed || 5) / (0.7071 * this.texel);
+        this.waveCfg = waveCfg;
+        this.state = [0, 1].map(() => makeTex(device, res, res, 'rgba32float', U.TEXTURE_BINDING | U.STORAGE_BINDING | U.COPY_DST));
+        this.disp = makeTex(device, res, res, 'rgba16float', U.TEXTURE_BINDING | U.STORAGE_BINDING, 2);
+        this.dispView = this.disp.createView({ dimension: '2d-array' });
+        this.uniform = new ArrayBuffer(80);
+        this.buf = makeBuffer(device, 80, BU().UNIFORM | BU().COPY_DST);
+        this.groups = new Map();
+        this.cur = 0;
+        this.slot = 0;
+        this.stepCount = 0;
+        this.acc = 0;
+        this.origin = null;
+        this.slotOrigin = [[0, 0], [0, 0]];
+        this.newest = 0;
+        this.splash = null;
+    }
+
+    group(a, slot) {
+        const key = a * 2 + slot;
+        if (!this.groups.has(key)) {
+            const b = 1 - a, f = this.flow;
+            this.groups.set(key, makeGroup(this.device, this.shared.layout, [this.buf, this.state[a].createView(), this.state[b].createView(),
+                f.flow.createView(), this.shared.sampler, this.disp.createView({ dimension: '2d', baseArrayLayer: slot, arrayLayerCount: 1 })]));
+        }
+        return this.groups.get(key);
+    }
+
+    reset() {
+        const z = new Float32Array(this.res * this.res * 4);
+        for (const t of this.state) this.device.queue.writeTexture({ texture: t }, z, { bytesPerRow: this.res * 16, rowsPerImage: this.res }, [this.res, this.res]);
+    }
+
+    encode(enc, dt, cam, flowScale) {
+        const period = 1 / this.hz;
+        this.acc += dt;
+        if (this.acc < period && this.origin) { this.lerpK = this.acc / period; return; }
+        this.acc = clamp(this.acc - period, 0, period);
+        this.lerpK = this.acc / period;
+        const t = this.texel, f = this.flow.world.field;
+        const o = [Math.floor((cam[0] - this.size / 2) / t) * t, Math.floor((cam[2] - this.size / 2) / t) * t];
+        const shift = this.origin ? [(o[0] - this.origin[0]) / t, (o[1] - this.origin[1]) / t] : [0, 0];
+        this.origin = o;
+        const u = new Float32Array(this.uniform), ui = new Int32Array(this.uniform), uu = new Uint32Array(this.uniform), w = this.waveCfg;
+        u.set([o[0], o[1], t]); ui[3] = this.res;
+        u.set([shift[0], shift[1], period * flowScale, w.damping ?? 0.985], 4);
+        u.set([f.origin, f.origin, f.size], 8); uu[11] = this.stepCount++;
+        u.set([w.noise ?? 1, w.foam ?? 1, this.flow.cfg.minDepth, this.heightScale], 12);
+        u.set(this.splash || [0, 0, 0, 0], 16);
+        this.splash = null;
+        this.device.queue.writeBuffer(this.buf, 0, this.uniform);
+        const g = Math.ceil(this.res / 8), pass = enc.beginComputePass({ label: `waves ${this.index}` });
+        pass.setPipeline(this.shared.pStep); pass.setBindGroup(0, this.group(this.cur, this.slot)); pass.dispatchWorkgroups(g, g);
+        pass.setPipeline(this.shared.pDisplay); pass.setBindGroup(0, this.group(1 - this.cur, this.slot)); pass.dispatchWorkgroups(g, g);
+        pass.end();
+        this.cur = 1 - this.cur;
+        this.slotOrigin[this.slot] = o;
+        this.newest = this.slot;
+        this.slot = 1 - this.slot;
+    }
+}
+
+class WaveCascade {
+    constructor(device, flow, cfg) {
+        this.cfg = { ...WAVE_DEFAULTS, ...(cfg || {}) };
+        const layout = makeLayout(device, GPUShaderStage.COMPUTE, ['uniform', 'tex:unfilterable-float', 'write:rgba32float', 'tex', 'sampler', 'write:rgba16float']);
+        const module = device.createShaderModule({ label: 'waves', code: WGSL_WAVES });
+        const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+        const shared = {
+            layout,
+            sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }),
+            pStep: device.createComputePipeline({ layout: pl, compute: { module, entryPoint: 'waveStep' } }),
+            pDisplay: device.createComputePipeline({ layout: pl, compute: { module, entryPoint: 'waveDisplay' } }),
+        };
+        this.layers = this.cfg.layers.slice(0, MAX_LAYERS).map((l, i) => new WaveLayer(device, shared, flow, l, this.cfg, i));
+    }
+
+    encode(enc, dt, cam, flowScale) { for (const l of this.layers) l.encode(enc, dt, cam, flowScale); }
+    splash(s) { for (const l of this.layers) l.splash = s; }
+    reset() { for (const l of this.layers) l.reset(); }
+}
+
+class DebrisSystem {
+    constructor(device, flow, world) {
+        const B = BU(), em = world.emitters.slice(0, 64);
+        this.device = device;
+        let total = 0;
+        const counts = em.map(e => { const c = Math.max(0, Math.min(e.count, MAX_PARTICLES - total)); total += c; return c; });
+        this.count = total;
+        const parts = new Float32Array(Math.max(1, total) * 8), rng = mulberry32(99);
+        let k = 0;
+        em.forEach((e, ei) => {
+            for (let c = 0; c < counts[ei]; c++, k++) {
+                const a = rng() * Math.PI * 2, r = Math.sqrt(rng()) * e.radius;
+                // random age spreads the respawns out; a dry start respawns them within seconds
+                parts.set([e.x + Math.cos(a) * r, 0, e.z + Math.sin(a) * r, rng() * e.life, rng() * 6.28, 3 + rng(), ei, rng()], k * 8);
+            }
+        });
+        const emData = new Float32Array(Math.max(1, em.length) * 8);
+        em.forEach((e, i) => emData.set([e.x, e.z, e.radius, e.life, ...e.color, e.size], i * 8));
+        this.particles = makeBuffer(device, parts.byteLength, B.STORAGE | B.COPY_SRC, parts);
+        this.emitters = makeBuffer(device, emData.byteLength, B.STORAGE, emData);
+        this.uniform = new ArrayBuffer(32);
+        this.buf = makeBuffer(device, 32, B.UNIFORM | B.COPY_DST);
+        const layout = makeLayout(device, GPUShaderStage.COMPUTE, ['uniform', 'storage', 'read', 'tex', 'sampler', 'tex:unfilterable-float', 'tex:unfilterable-float']);
+        const module = device.createShaderModule({ label: 'debris', code: WGSL_DEBRIS_SIM });
+        this.pipe = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module, entryPoint: 'updateDebris' } });
+        const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+        this.group = makeGroup(device, layout, [this.buf, this.particles, this.emitters, flow.flow.createView(), sampler, flow.surf.createView(), flow.terrain.createView()]);
+        this.field = world.field;
+        this.minDepth = flow.cfg.minDepth;
+    }
+
+    encode(enc, dt, time) {
+        if (!this.count) return;
+        const f = new Float32Array(this.uniform), u = new Uint32Array(this.uniform), i = new Int32Array(this.uniform);
+        f[0] = dt; f[1] = time % 10000; u[2] = this.count; i[3] = this.field.n;
+        f.set([this.field.origin, this.field.origin, this.field.cell, this.minDepth], 4);
+        this.device.queue.writeBuffer(this.buf, 0, this.uniform);
+        const pass = enc.beginComputePass({ label: 'debris' });
+        pass.setPipeline(this.pipe); pass.setBindGroup(0, this.group); pass.dispatchWorkgroups(Math.ceil(this.count / 64));
+        pass.end();
+    }
+}
+
+// =====================================================================================================
+// Renderer
+// =====================================================================================================
+class Renderer {
+    async init(canvas) {
+        if (!navigator.gpu) throw new Error('navigator.gpu is undefined');
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        if (!adapter) throw new Error('No WebGPU adapter available');
+        this.device = await adapter.requestDevice();
+        this.device.lost.then(info => { if (info.reason !== 'destroyed') this.onError?.(new Error(`GPU device lost: ${info.message}`)); });
+        this.device.addEventListener('uncapturederror', e => { console.error(e.error.message); this.lastError = e.error.message; });
+        this.canvas = canvas;
+        this.context = canvas.getContext('webgpu');
+        this.format = navigator.gpu.getPreferredCanvasFormat();
+        this.context.configure({ device: this.device, format: this.format, alphaMode: 'opaque' });
+        this.frameData = new Float32Array(FRAME_FLOATS);
+        this.frameBuf = makeBuffer(this.device, FRAME_FLOATS * 4, BU().UNIFORM | BU().COPY_DST);
+        this.createPipelines();
+        this.width = this.height = 0;
+    }
+
+    createPipelines() {
+        const d = this.device, VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+        this.worldLayout = makeLayout(d, VF, ['uniform', 'tex:unfilterable-float', 'tex:unfilterable-float', 'tex', 'sampler', 'array', 'array', 'array', 'array', 'read', 'read']);
+        this.screenLayout = makeLayout(d, GPUShaderStage.FRAGMENT, ['tex', 'tex:depth']);
+        this.sampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+        const U = TU();
+        this.dummyArray = makeTex(d, 1, 1, 'rgba16float', U.TEXTURE_BINDING, 2).createView({ dimension: '2d-array' });
+        const scene = d.createShaderModule({ label: 'scene', code: WGSL_COMMON + WGSL_SCENE });
+        const surface = d.createShaderModule({ label: 'surface', code: WGSL_COMMON + WGSL_SURFACE });
+        const layoutA = d.createPipelineLayout({ bindGroupLayouts: [this.worldLayout] });
+        const layoutB = d.createPipelineLayout({ bindGroupLayouts: [this.worldLayout, this.screenLayout] });
+        const pipe = (layout, module, vs, fs, format, depth, extra = {}) => d.createRenderPipeline({
+            label: vs, layout,
+            vertex: { module, entryPoint: vs },
+            fragment: { module, entryPoint: fs, targets: [{ format }] },
+            primitive: { topology: 'triangle-list', cullMode: extra.cull || 'none' },
+            depthStencil: { format: 'depth32float', depthWriteEnabled: depth.write, depthCompare: depth.compare },
+        });
+        this.pSky = pipe(layoutA, scene, 'vsSky', 'fsSky', 'rgba16float', { write: false, compare: 'always' });
+        this.pTerrain = pipe(layoutA, scene, 'vsTerrain', 'fsTerrain', 'rgba16float', { write: true, compare: 'greater' });
+        this.pComposite = pipe(layoutB, surface, 'vsComposite', 'fsComposite', this.format, { write: false, compare: 'always' });
+        this.pWater = pipe(layoutB, surface, 'vsWater', 'fsWater', this.format, { write: false, compare: 'greater' });
+        this.pDebris = pipe(layoutB, surface, 'vsDebris', 'fsDebris', this.format, { write: false, compare: 'greater' }, { cull: 'back' });
+    }
+
+    setSim(world, flow, waves, debris) {
+        const d = this.device, n = world.field.n, U = BU();
+        this.terrainIndex?.destroy();
+        this.waterIndex?.destroy();
+        const ti = gridIndices(n + 2), wi = gridIndices(n);
+        this.terrainIndex = makeBuffer(d, ti.byteLength, U.INDEX, ti);
+        this.terrainCount = ti.length;
+        this.waterIndex = makeBuffer(d, wi.byteLength, U.INDEX, wi);
+        this.waterCount = wi.length;
+        const disp = [0, 1, 2, 3].map(i => waves.layers[i] ? waves.layers[i].dispView : this.dummyArray);
+        this.worldGroup = makeGroup(d, this.worldLayout, [this.frameBuf, flow.terrain.createView(), flow.surf.createView(), flow.flow.createView(),
+            this.sampler, ...disp, debris.particles, debris.emitters], 'world');
+        this.debrisCount = debris.count;
+    }
+
+    resize() {
+        const c = this.canvas, dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.max(1, Math.floor(c.clientWidth * dpr)), h = Math.max(1, Math.floor(c.clientHeight * dpr));
+        if (w === this.width && h === this.height) return;
+        this.width = c.width = w;
+        this.height = c.height = h;
+        const U = TU();
+        this.hdr?.destroy();
+        this.depth?.destroy();
+        this.hdr = makeTex(this.device, w, h, 'rgba16float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING);
+        this.depth = makeTex(this.device, w, h, 'depth32float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING);
+        this.hdrView = this.hdr.createView();
+        this.depthView = this.depth.createView();
+        this.screenGroup = makeGroup(this.device, this.screenLayout, [this.hdrView, this.depthView], 'screen');
+    }
+
+    render(enc) {
+        this.device.queue.writeBuffer(this.frameBuf, 0, this.frameData);
+        const a = enc.beginRenderPass({
+            label: 'scene',
+            colorAttachments: [{ view: this.hdrView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+            depthStencilAttachment: { view: this.depthView, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 0 },
+        });
+        a.setBindGroup(0, this.worldGroup);
+        a.setPipeline(this.pSky);
+        a.draw(3);
+        a.setPipeline(this.pTerrain);
+        a.setIndexBuffer(this.terrainIndex, 'uint32');
+        a.drawIndexed(this.terrainCount);
+        a.end();
+
+        const b = enc.beginRenderPass({
+            label: 'surface',
+            colorAttachments: [{ view: this.context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+            depthStencilAttachment: { view: this.depthView, depthReadOnly: true },
+        });
+        b.setBindGroup(0, this.worldGroup);
+        b.setBindGroup(1, this.screenGroup);
+        b.setPipeline(this.pComposite);
+        b.draw(3);
+        b.setPipeline(this.pWater);
+        b.setIndexBuffer(this.waterIndex, 'uint32');
+        b.drawIndexed(this.waterCount);
+        if (this.debrisCount) { b.setPipeline(this.pDebris); b.draw(36, this.debrisCount); }
+        b.end();
+    }
+}
+
+// =====================================================================================================
+// Game
+// =====================================================================================================
+class Input {
+    constructor(el) {
+        this.el = el;
+        this.keys = new Set();
+        this.pressed = [];
+        this.dx = this.dy = this.wheel = 0;
+        this.mouse = [0, 0];
+        this.looking = false;
+        this.acting = false;
+        el.addEventListener('contextmenu', e => e.preventDefault());
+        el.addEventListener('pointerdown', e => {
+            el.setPointerCapture(e.pointerId);
+            if (e.button === 2 || (e.button === 0 && e.ctrlKey)) this.acting = true;
+            else if (e.button === 0) { this.looking = true; el.classList.add('drag'); }
+        });
+        el.addEventListener('pointermove', e => {
+            this.mouse = [e.clientX, e.clientY];
+            if (this.looking) { this.dx += e.movementX; this.dy += e.movementY; }
+        });
+        const up = () => { this.looking = this.acting = false; el.classList.remove('drag'); };
+        el.addEventListener('pointerup', up);
+        el.addEventListener('pointercancel', up);
+        el.addEventListener('wheel', e => { e.preventDefault(); this.wheel += Math.sign(e.deltaY); }, { passive: false });
+        window.addEventListener('keydown', e => {
+            if (['Space', 'Tab'].includes(e.code)) e.preventDefault();
+            if (!e.repeat) this.pressed.push(e.code);
+            this.keys.add(e.code);
+        });
+        window.addEventListener('keyup', e => this.keys.delete(e.code));
+        window.addEventListener('blur', () => { this.keys.clear(); up(); });
+    }
+
+    consume() {
+        const r = { dx: this.dx, dy: this.dy, wheel: this.wheel, pressed: this.pressed };
+        this.dx = this.dy = this.wheel = 0;
+        this.pressed = [];
+        return r;
+    }
+}
+
+class FlyCamera {
+    constructor() {
+        this.pos = [0, 200, 0];
+        this.yaw = 0;
+        this.pitch = 0;
+        this.fov = 60 * DEG;
+        this.speed = 80;
+    }
+
+    basis() {
+        const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw), cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
+        const fwd = [-sy * cp, sp, -cy * cp], right = [cy, 0, -sy];
+        return { fwd, right, up: v3.cross(right, fwd) };
+    }
+
+    lookAt(target) {
+        const d = v3.norm(v3.sub(target, this.pos));
+        this.yaw = Math.atan2(-d[0], -d[2]);
+        this.pitch = Math.asin(clamp(d[1], -1, 1));
+    }
+
+    update(dt, io, input, field) {
+        this.yaw -= io.dx * 0.0025;
+        this.pitch = clamp(this.pitch - io.dy * 0.0025, -1.55, 1.55);
+        if (io.wheel) this.speed = clamp(this.speed * Math.pow(1.2, -io.wheel), 2, 2000);
+        const k = input.keys, { fwd, right } = this.basis();
+        let m = [0, 0, 0];
+        if (k.has('KeyW')) m = v3.add(m, fwd);
+        if (k.has('KeyS')) m = v3.sub(m, fwd);
+        if (k.has('KeyD')) m = v3.add(m, right);
+        if (k.has('KeyA')) m = v3.sub(m, right);
+        if (k.has('Space')) m[1] += 1;
+        if (k.has('KeyC')) m[1] -= 1;
+        const mul = (k.has('ShiftLeft') || k.has('ShiftRight') ? 5 : 1) * (k.has('AltLeft') ? 0.2 : 1);
+        this.pos = v3.add(this.pos, v3.mul(m, this.speed * mul * dt));
+        this.pos[1] = Math.max(this.pos[1], field.sample(this.pos[0], this.pos[2]) + 2);
+    }
+
+    ray(mx, my, w, h) {
+        const { fwd, right, up } = this.basis(), t = Math.tan(this.fov / 2), a = w / h;
+        const x = (mx / w * 2 - 1) * t * a, y = (1 - my / h * 2) * t;
+        return v3.norm(v3.add(fwd, v3.add(v3.mul(right, x), v3.mul(up, y))));
+    }
+}
+
+// --------------------------------------------------------------------------------------------- tools
+// Applied with the right mouse button (or Ctrl + left) where the cursor ray meets the terrain.
+class Tool {
+    constructor(def) { this.def = def; this.key = def.key; }
+    get name() { return this.def.type; }
+    apply(app, hit, dt) {}
+}
+class PourTool extends Tool {
+    apply(app, hit) { app.extraSources.push({ x: hit[0], z: hit[2], radius: app.brush, rate: this.def.rate ?? 40 }); }
+}
+class DrainTool extends Tool {
+    apply(app, hit) { app.extraSources.push({ x: hit[0], z: hit[2], radius: app.brush, rate: -(this.def.rate ?? 40), flat: true }); }
+}
+class TerrainTool extends Tool {
+    constructor(def, sign) { super(def); this.sign = sign; }
+    apply(app, hit, dt) { app.world.field.brush(hit[0], hit[2], app.brush, this.sign * (this.def.rate ?? 6) * dt); }
+}
+class SplashTool extends Tool {
+    apply(app, hit) {
+        app.waves.splash([hit[0], hit[2], app.brush, this.def.strength ?? 0.9]);
+        app.extraSources.push({ x: hit[0], z: hit[2], radius: app.brush * 0.5, rate: 10 });
+    }
+}
+const TOOL_TYPES = {
+    pour: d => new PourTool(d),
+    drain: d => new DrainTool(d),
+    raise: d => new TerrainTool(d, 1),
+    dig: d => new TerrainTool(d, -1),
+    splash: d => new SplashTool(d),
+};
+
+// -------------------------------------------------------------------------------------------------- hud
+function fmtNum(x, unit = '') {
+    const a = Math.abs(x);
+    if (a >= 1e9) return `${(x / 1e9).toFixed(2)}G${unit}`;
+    if (a >= 1e6) return `${(x / 1e6).toFixed(2)}M${unit}`;
+    if (a >= 1e4) return `${(x / 1e3).toFixed(1)}k${unit}`;
+    return `${x.toFixed(a < 10 ? 1 : 0)}${unit}`;
+}
+
+class Hud {
+    constructor() {
+        this.el = document.getElementById('hud');
+        this.help = document.getElementById('help');
+        this.toolsEl = document.getElementById('tools');
+        this.toastEl = document.getElementById('toast');
+        this.labels = document.getElementById('labels');
+        this.lctx = this.labels.getContext('2d');
+        this.showLabels = true;
+        this.last = 0;
+        this.help.innerHTML = [
+            '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
+            '<b>right drag</b> (or Ctrl + drag) use tool   <b>[ ]</b> brush size',
+            '<b>B</b> boost springs   <b>R</b> rain   <b>X</b> breach / rebuild dams   <b>N</b> reset water',
+            '<b>M</b> render mode   <b>V</b> next view   <b>G</b> lighting   <b>, .</b> sim steps / frame',
+            '<b>L</b> labels   <b>P</b> pause   <b>H</b> help   drop a scenario .json on the page',
+        ].join('\n');
+    }
+
+    setTools(tools, current, brush) {
+        this.toolsEl.innerHTML = tools.map(t => `<b>${t.key}</b> <span class="${t === current ? 'sel' : ''}">${t.name}</span>`).join('   ') + `\nbrush ${brush.toFixed(0)} m`;
+    }
+
+    toast(msg, ms = 2200) {
+        this.toastEl.textContent = msg;
+        this.toastEl.style.display = 'block';
+        clearTimeout(this.tid);
+        this.tid = setTimeout(() => { this.toastEl.style.display = 'none'; }, ms);
+    }
+
+    update(app, now) {
+        if (now - this.last < 150) return;
+        this.last = now;
+        const w = app.world, f = w.field, sim = app.flow, st = sim.stats, c = sim.cfg;
+        const onoff = v => v ? '<span class="on">on </span>' : '<span class="m">off</span>';
+        const simRate = app.stepsPerFrame * c.stepTime * app.fps;
+        const layers = app.waves.layers.map(l => `${l.size} m @ ${l.texel.toFixed(2)} m, ${l.hz.toFixed(0)} Hz`).join(' · ');
+        const dams = w.entities.filter(e => e instanceof Dam);
+        const lines = [
+            `<span class="t">ENTITY WATER // ${w.scenario.name || 'scenario'}</span>`,
+            `flow sim  ${f.n}×${f.n} cells of ${f.cell.toFixed(1)} m · ${app.paused ? '<span class="w">paused</span>' : `${app.stepsPerFrame} steps/frame`} · ${fmtNum(simRate)}× real time`,
+            `water     ${fmtNum(st.volume, ' m³')} · wet ${(st.wet * f.cell * f.cell / 1e6).toFixed(2)} km² · max ${st.maxSpeed.toFixed(1)} m/s`,
+            `inflow    ${fmtNum(sim.inflow || 0, ' m³/s')}   boost ${onoff(w.boost)}  rain ${onoff(w.rainOn)}${dams.length ? `  dam ${dams.some(d => d.target) ? '<span class="off">breached</span>' : '<span class="on">intact</span>'}` : ''}`,
+            `waves     ${layers || 'none'}`,
+            `debris    ${app.debris.count.toLocaleString()} logs · ${w.entities.length} entities · edges ${['closed', 'open', `sea ${w.seaLevel} m`][sim.edgeMode]}`,
+            `view      ${RENDER_MODES[app.mode]} · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
+        ];
+        if (sim.warmupLeft > 0) lines.push(`<span class="w">settling water... ${Math.round(100 * (1 - sim.warmupLeft / c.warmup))}%</span>`);
+        if (app.renderer.lastError) lines.push(`<span class="off">${app.renderer.lastError.slice(0, 90)}</span>`);
+        this.el.innerHTML = lines.join('\n');
+    }
+
+    drawLabels(app) {
+        const c = this.labels, dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const W = Math.floor(c.clientWidth * dpr), H = Math.floor(c.clientHeight * dpr);
+        if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+        const g = this.lctx;
+        g.clearRect(0, 0, W, H);
+        if (!this.showLabels) return;
+        g.font = `${11 * dpr}px 'Share Tech Mono', monospace`;
+        g.textBaseline = 'middle';
+        for (const e of app.world.entities) {
+            if (!e.label) continue;
+            const p = e.anchor;
+            if (!p) continue;
+            const clip = m4.project(app.viewProj, p);
+            if (clip[3] <= 0) continue;
+            const x = (clip[0] / clip[3] * 0.5 + 0.5) * W, y = (0.5 - clip[1] / clip[3] * 0.5) * H;
+            if (x < -50 || x > W + 50 || y < -20 || y > H + 20) continue;
+            const d = v3.len(v3.sub(p, app.camera.pos));
+            g.strokeStyle = g.fillStyle = e instanceof Spring || e instanceof Lake || e instanceof Sea ? 'rgba(110,220,255,0.9)' : 'rgba(255,201,74,0.9)';
+            g.lineWidth = dpr;
+            g.beginPath();
+            g.moveTo(x, y - 4 * dpr); g.lineTo(x + 4 * dpr, y); g.lineTo(x, y + 4 * dpr); g.lineTo(x - 4 * dpr, y); g.closePath();
+            g.stroke();
+            const extra = e instanceof Spring ? ` ${(e.def.rate * (app.world.boost ? (e.def.boost ?? 8) : 1)).toFixed(0)} m³/s` : '';
+            g.fillText(`${e.label}${extra}  ${d < 1000 ? d.toFixed(0) + ' m' : (d / 1000).toFixed(2) + ' km'}`, x + 8 * dpr, y);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------- app
+class App {
+    constructor(canvas) {
+        this.canvas = canvas;
+        this.renderer = new Renderer();
+        this.input = new Input(canvas);
+        this.hud = new Hud();
+        this.camera = new FlyCamera();
+        this.time = 0;
+        this.paused = false;
+        this.fps = 60;
+        this.mode = 0;
+        this.brush = 20;
+        this.extraSources = [];
+        this.viewProj = new Float32Array(16);
+        this.frameNo = 0;
+    }
+
+    async start() { await this.renderer.init(this.canvas); }
+
+    load(scenario) {
+        const d = this.renderer.device;
+        const world = new World(scenario);
+        const flow = new FlowSim(d, world);
+        const waves = new WaveCascade(d, flow, scenario.waves);
+        const debris = new DebrisSystem(d, flow, world);
+        Object.assign(this, { world, flow, waves, debris, scenario });
+        this.renderer.setSim(world, flow, waves, debris);
+        this.stepsPerFrame = flow.cfg.stepsPerFrame;
+        this.water = { ...WATER_DEFAULTS, ...(scenario.water || {}) };
+        this.tools = (scenario.tools || []).filter(t => TOOL_TYPES[t.type]).map(t => TOOL_TYPES[t.type](t));
+        this.tool = this.tools[0] || null;
+        this.hud.setTools(this.tools, this.tool, this.brush);
+        const L = scenario.lighting || {};
+        this.lightNames = Object.keys(L).filter(k => typeof L[k] === 'object');
+        this.setLight(L.start && L[L.start] ? L.start : this.lightNames[0]);
+        this.views = scenario.views || [];
+        this.viewIndex = 0;
+        if (this.views[0]) this.jump(this.views[0]);
+        if (!this.running) { this.running = true; this.last = performance.now(); requestAnimationFrame(t => this.frame(t)); }
+    }
+
+    setLight(name) {
+        const p = (this.scenario.lighting || {})[name] || {};
+        const sun = p.sun || {}, az = (sun.azimuth ?? 150) * DEG, el = (sun.elevation ?? 40) * DEG;
+        this.lightName = name || 'default';
+        this.light = {
+            dir: [Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az)],
+            color: sun.color || [1, 0.95, 0.85], intensity: sun.intensity ?? 3,
+            top: p.sky?.top || [0.22, 0.42, 0.78], horizon: p.sky?.horizon || [0.62, 0.74, 0.86],
+            ground: p.ground || [0.24, 0.22, 0.18], ambient: p.ambient ?? 0.9, fog: p.fog ?? 0.00025, exposure: p.exposure ?? 1,
+        };
+    }
+
+    jump(v) {
+        this.camera.pos = [...v.pos];
+        if (v.look) this.camera.lookAt(v.look);
+        this.hud.toast(v.name);
+    }
+
+    handleKeys(pressed) {
+        const w = this.world;
+        for (const code of pressed) {
+            const t = this.tools.find(t => code === `Digit${t.key}` || code === `Numpad${t.key}`);
+            if (t) { this.tool = t; this.hud.setTools(this.tools, t, this.brush); continue; }
+            switch (code) {
+                case 'BracketLeft': case 'BracketRight':
+                    this.brush = clamp(this.brush * (code === 'BracketRight' ? 1.25 : 0.8), 4, 200);
+                    this.hud.setTools(this.tools, this.tool, this.brush);
+                    break;
+                case 'KeyB': w.boost = !w.boost; this.hud.toast(w.boost ? 'Springs boosted' : 'Springs normal'); break;
+                case 'KeyR': w.rainOn = !w.rainOn; this.hud.toast(w.rainOn ? 'Rain' : 'Rain stopped'); break;
+                case 'KeyX': {
+                    const dams = w.entities.filter(e => e instanceof Dam);
+                    if (!dams.length) { this.hud.toast('No dams in this scenario'); break; }
+                    const on = dams.map(d => d.toggle())[0];
+                    this.hud.toast(on ? 'Dam breached!' : 'Dam rebuilt');
+                    break;
+                }
+                case 'KeyN': this.flow.reset(); this.waves.reset(); this.hud.toast('Water reset'); break;
+                case 'KeyM': this.mode = (this.mode + 1) % RENDER_MODES.length; this.hud.toast(`Render: ${RENDER_MODES[this.mode]}`); break;
+                case 'KeyV': if (this.views.length) { this.viewIndex = (this.viewIndex + 1) % this.views.length; this.jump(this.views[this.viewIndex]); } break;
+                case 'KeyG': {
+                    const i = (this.lightNames.indexOf(this.lightName) + 1) % this.lightNames.length;
+                    this.setLight(this.lightNames[i]);
+                    this.hud.toast(`Lighting: ${this.lightName}`);
+                    break;
+                }
+                case 'Comma': case 'Period':
+                    this.stepsPerFrame = clamp(this.stepsPerFrame + (code === 'Period' ? 8 : -8), 0, 256);
+                    this.hud.toast(`${this.stepsPerFrame} sim steps per frame`);
+                    break;
+                case 'KeyL': this.hud.showLabels = !this.hud.showLabels; break;
+                case 'KeyP': this.paused = !this.paused; break;
+                case 'KeyH': this.hud.help.style.display = this.hud.help.style.display === 'none' ? '' : 'none'; break;
+            }
+        }
+    }
+
+    writeFrame(hit) {
+        const r = this.renderer, F = r.frameData, cam = this.camera, f = this.world.field, L = this.light, wt = this.water;
+        const aspect = r.width / r.height, tanY = Math.tan(cam.fov / 2), tanX = tanY * aspect;
+        const { fwd, right, up } = cam.basis();
+        this.viewProj = m4.mul(m4.reversedInfinite(cam.fov, aspect, NEAR), m4.view(cam.pos, right, up, fwd));
+        F.set(this.viewProj, 0);
+        F.set([...cam.pos, this.time % 3600], 16);
+        F.set([...fwd, NEAR], 20);
+        F.set([...v3.mul(right, tanX), 0], 24);
+        F.set([...v3.mul(up, tanY), 0], 28);
+        F.set([...L.dir, L.intensity], 32);
+        F.set([...L.color, L.exposure], 36);
+        F.set([...L.top, L.fog], 40);
+        F.set([...L.horizon, f.max + 5], 44);
+        F.set([...L.ground, L.ambient], 48);
+        F.set([f.origin, f.origin, f.cell, f.n], 52);
+        F.set([r.width, r.height, this.flow.cfg.minDepth, this.mode], 56);
+        F.set([...wt.deep, wt.foam], 60);
+        F.set([...wt.absorb, wt.refraction], 64);
+        F.set(hit ? [hit[0], hit[2], this.brush, 1] : [0, 0, 0, 0], 68);
+        F.set([this.waves.layers.length, wt.detail, this.world.snowLine, this.world.seaLevel ?? -1e4], 72);
+        this.waves.layers.forEach((l, i) => {
+            const cur = l.slotOrigin[l.newest], old = l.slotOrigin[1 - l.newest];
+            F.set([cur[0], cur[1], l.size, l.lerpK ?? 1], 76 + i * 4);
+            F.set([old[0], old[1], l.newest, 0], 92 + i * 4);
+        });
+        F.set([wt.flowScale, 0, 0, 0], 108);
+    }
+
+    frame(now) {
+        requestAnimationFrame(t => this.frame(t));
+        const dt = Math.min(0.1, (now - this.last) / 1000);
+        this.last = now;
+        if (dt > 0) this.fps = this.fps * 0.95 + (1 / dt) * 0.05;
+        if (!this.paused) this.time += dt;
+        const io = this.input.consume();
+        this.handleKeys(io.pressed);
+
+        const r = this.renderer, w = this.world, flow = this.flow, d = r.device;
+        r.resize();
+        this.camera.update(dt, io, this.input, w.field);
+
+        // cursor ray -> terrain, tools
+        const rect = this.canvas.getBoundingClientRect();
+        const mx = this.input.mouse[0] - rect.left, my = this.input.mouse[1] - rect.top;
+        const hit = w.field.raycast(this.camera.pos, this.camera.ray(mx, my, rect.width, rect.height));
+        this.extraSources = [];
+        if (hit && this.input.acting && this.tool && !this.paused) this.tool.apply(this, hit, dt);
+
+        if (!this.paused) w.update(dt, this.time);
+        if (w.field.dirty) flow.uploadTerrain();
+
+        const enc = d.createCommandEncoder();
+        if (!this.paused) {
+            let steps = this.stepsPerFrame;
+            if (flow.warmupLeft > 0) { const extra = Math.min(flow.warmupLeft, 600); flow.warmupLeft -= extra; steps += extra; }
+            flow.writeParams(w.gather(), this.extraSources, this.frameNo++);
+            flow.encode(enc, steps);
+            this.waves.encode(enc, dt, this.camera.pos, this.water.flowScale);
+            this.debris.encode(enc, dt * this.water.flowScale, this.time);
+        }
+        this.writeFrame(hit);
+        r.render(enc);
+        d.queue.submit([enc.finish()]);
+        flow.afterSubmit();
+        this.hud.drawLabels(this);
+        this.hud.update(this, now);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------- main
+function showFallback(e) {
+    console.error(e);
+    document.getElementById('error-message').textContent = String(e && (e.stack || e.message) || e);
+    document.getElementById('fallback').classList.add('show');
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+    const app = new App(document.getElementById('view'));
+    app.renderer.onError = showFallback;
+    window.waterDemo = app;        // devtools: world, flow, waves, camera
+    try {
+        await app.start();
+        app.load(JSON.parse(document.getElementById('scenario').textContent));
+    } catch (err) {
+        showFallback(err);
+        return;
+    }
+    window.addEventListener('dragover', e => e.preventDefault());
+    window.addEventListener('drop', async e => {
+        e.preventDefault();
+        const file = e.dataTransfer.files[0];
+        if (!file) return;
+        try {
+            app.load(JSON.parse(await file.text()));
+            app.hud.toast(`Loaded ${file.name}`);
+        } catch (err) {
+            app.hud.toast(`Could not load ${file.name}: ${err.message}`, 5000);
+        }
+    });
+});
+</script>
+</body>
+</html>
